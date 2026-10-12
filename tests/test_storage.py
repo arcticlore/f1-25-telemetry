@@ -392,3 +392,34 @@ def test_storage_writer_stats(tmp_path):
     assert st["ops"] >= 51
     assert st["errors"] == 0
     assert st["queued"] >= 0
+
+
+def test_session_uid_u64_overflow(tmp_path):
+    """sessionUID > 2^63-1 (реальные u64 из F1 25) не роняет запись.
+
+    SQLite INTEGER — знаковый int64; игра шлёт полный u64. Регрессия:
+    UID 14147937499142393072 ронял каждый op с OverflowError (FP3 в БД
+    не писалась совсем). Адаптер в storage.py конвертирует бит-в-бит.
+    """
+    big = 14147937499142393072  # > 2^63-1
+    db = tmp_path / "big.sqlite"
+    st = Storage(db)
+    st.upsert_session(big, packet_format=2025, track_id=5, track_name="Monaco",
+                      session_type=2, session_type_name="P3")
+    st.upsert_participant(big, 0, name="Test Driver", team_id=0,
+                          team_name="Mercedes", race_number=44)
+    st.insert_event(big, 1.0, "SSTA", None, None, {"x": 1})
+    st.commit()
+
+    sessions = st.list_sessions()
+    assert [s.session_uid for s in sessions] == [big]
+    assert sessions[0].track_name == "Monaco"
+    assert st.list_participants(big)[0]["name"] == "Test Driver"
+    assert len(st.events(big)) == 1
+    assert st.get_session(big) is not None
+
+    # и в обратную сторону: маленькие uid не ломаются
+    st.upsert_session(UID)
+    st.commit()
+    assert {s.session_uid for s in st.list_sessions()} == {big, UID}
+    st.close()

@@ -27,6 +27,30 @@ SCHEMA_VERSION = 1
 
 WAL_TIMEOUT_S = 10.0
 
+
+def _adapt_int(v: int) -> int:
+    """u64 из игры → signed int64 для SQLite (бит-в-бит, two's complement).
+
+    sessionUID в F1 25 — это u64 (полный диапазон), а SQLite INTEGER —
+    знаковый int64. Без конвертации UID вида 1.4e19 роняет каждый op
+    с OverflowError. Значения других колонок всегда влезают в int64,
+    адаптер пропускает их без изменений.
+    """
+    if -0x8000000000000000 <= v < 0x8000000000000000:
+        return v
+    v &= 0xFFFFFFFFFFFFFFFF
+    return v - 0x10000000000000000 if v >= 0x8000000000000000 else v
+
+
+def _uid_from_db(v: int | None) -> int | None:
+    """signed int64 из SQLite → исходный u64 sessionUID."""
+    if v is not None and v < 0:
+        return v + 0x10000000000000000
+    return v
+
+
+sqlite3.register_adapter(int, _adapt_int)
+
 __all__ = [
     "SCHEMA_VERSION",
     "Storage",
@@ -636,7 +660,12 @@ class Storage:
         sql.append(" ORDER BY s.session_uid DESC LIMIT ?")
         params.append(limit)
         rows = self.conn.execute("".join(sql), params).fetchall()
-        return [SessionInfo(**dict(r)) for r in rows]
+        out: list[SessionInfo] = []
+        for r in rows:
+            d = dict(r)
+            d["session_uid"] = int(_uid_from_db(d["session_uid"]) or 0)
+            out.append(SessionInfo(**d))
+        return out
 
     def get_session(self, session_uid: int) -> sqlite3.Row | None:
         """Строка сессии или ``None``."""
