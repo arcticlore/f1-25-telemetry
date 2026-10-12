@@ -733,6 +733,7 @@ class SimConfig:
     fixture: Path | None = None
     loop_forever: bool = False
     verbose: bool = True
+    pace_ms: float = 0.2
 
 
 class Simulator:
@@ -925,8 +926,10 @@ class Simulator:
         return out
 
     def _hdr(self, packet_id: int) -> bytes:
+        # overall_frame_identifier инкрементируется на 1 за тик (как в игре);
+        # «frame * 3» давал ложные lost_frames в SessionState
         return pack_header(
-            packet_id, self.cfg.session_uid, self.t, self.frame, self.frame * 3,
+            packet_id, self.cfg.session_uid, self.t, self.frame, self.frame,
             secondary=self.cfg.secondary_car,
         )
 
@@ -1035,8 +1038,13 @@ class Simulator:
                 self.fixture_fh.write(d)
         if self.sock is not None:
             addr = (self.cfg.host, self.cfg.port)
+            pace_s = max(0.0, self.cfg.pace_ms) / 1000.0
             for d in datagrams:
                 self.sock.sendto(d, addr)
+                if pace_s > 0:
+                    # межпакетная пауза: бёрст одного тика иначе теряется
+                    # в UDP-буфере при частоте 60 Гц
+                    time.sleep(pace_s)
         self.packets_sent += len(datagrams)
 
     def close(self) -> None:
@@ -1149,6 +1157,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pit-laps", default="", help="comma separated pit stop laps")
     p.add_argument("--safety-car-lap", type=int, default=None)
     p.add_argument("--loop", action="store_true", help="do not stop on the timer")
+    p.add_argument("--pace-ms", type=float, default=0.2,
+                   help="пауза между UDP-датаграммами, мс (0 = без пауз; "
+                        "гасит потери бёрстов на 60 Гц)")
     p.add_argument("--record-fixture", type=Path, default=None)
     p.add_argument("--verify-sizes", action="store_true",
                    help="check sizes of all 16 packets and exit")
@@ -1181,6 +1192,7 @@ def main(argv: list[str] | None = None) -> int:
         fixture=args.record_fixture,
         loop_forever=args.loop,
         verbose=not args.quiet,
+        pace_ms=args.pace_ms,
     )
     sim = Simulator(cfg)
     if not args.quiet:

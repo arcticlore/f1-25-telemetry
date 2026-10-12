@@ -89,6 +89,7 @@ class RecorderStats:
         self.parse_errors = 0
         self.format_errors = 0
         self.unsupported_formats: set[int] = set()
+        self.source_filtered = 0
         self.laps_completed = 0
         self.sessions_seen = 0
         self.flashbacks = 0
@@ -105,6 +106,7 @@ class RecorderStats:
                 "parse_errors": self.parse_errors,
                 "format_errors": self.format_errors,
                 "unsupported_formats": sorted(self.unsupported_formats),
+                "source_filtered": self.source_filtered,
                 "laps_completed": self.laps_completed,
                 "sessions_seen": self.sessions_seen,
                 "flashbacks": self.flashbacks,
@@ -129,6 +131,9 @@ class Recorder:
         buffer_seconds: глубина кольцевого буфера живого графика.
         fixture: путь к фикстуре — вместо UDP-приёма (для replay/тестов).
         replay_speed: реальная скорость воспроизведения фикстуры (0 — мгновенно).
+        source_filter: принимать датаграммы только с этого IP (адрес игровой
+            машины); ``None`` — принимать от всех. Фикстура/``feed`` не
+            фильтруются (IP там неизвестен).
     """
 
     def __init__(
@@ -145,12 +150,14 @@ class Recorder:
         replay_speed: float = 0.0,
         flush_interval: float = 0.5,
         batch_size: int = 500,
+        source_filter: str | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.host = host
         self.port = port
         self.fixture = Path(fixture) if fixture is not None else None
         self.replay_speed = replay_speed
+        self.source_filter = source_filter
 
         self.state = SessionState(
             sample_hz=sample_hz,
@@ -180,7 +187,7 @@ class Recorder:
         self.on_laps: Callable[[tuple[int, ...]], None] | None = None
         self.on_event: Callable[[str, dict[str, Any]], None] | None = None
         self.on_flashback: Callable[[], None] | None = None
-        self.on_format_warning: Callable[[int], None] | None = None
+        self.on_format_warning: Callable[[int, str], None] | None = None
         self.on_stats: Callable[[dict[str, Any]], None] | None = None
 
     # --- жизненный цикл ----------------------------------------------------
@@ -284,9 +291,10 @@ class Recorder:
     def _loop(self) -> None:  # pragma: no cover — покрыто интеграционными тестами
         last_stats_emit = 0.0
         while not self._stop.is_set():
-            data = self._next_datagram()
-            if data is not None:
-                self.handle_datagram(data)
+            item = self._next_datagram()
+            if item is not None:
+                data, src = item
+                self.handle_datagram(data, src_addr=src)
             now = time.monotonic()
             if now - last_stats_emit >= 1.0:
                 last_stats_emit = now
@@ -301,14 +309,14 @@ class Recorder:
                     break
         self._flush_writes()
 
-    def _next_datagram(self) -> bytes | None:
+    def _next_datagram(self) -> tuple[bytes, str] | None:
         if self.fixture is not None:
             return self._next_from_fixture()
         if self.listener is None:  # pragma: no cover
             return None
         return self.listener.get(timeout=0.05)
 
-    def _next_from_fixture(self) -> bytes | None:
+    def _next_from_fixture(self) -> tuple[bytes, str] | None:
         if self._fixture_iter is None:
             self._fixture_iter = iter_fixture(self.fixture)  # type: ignore[arg-type]
         try:
@@ -326,29 +334,49 @@ class Recorder:
                     if dt > 0:
                         time.sleep(min(dt, 0.5))
                 self._fixture_last_t = t
-        return data
+        return data, ""
 
-    def handle_datagram(self, data: bytes) -> PacketResult:
+    def handle_datagram(
+        self, data: bytes, *, src_addr: str | None = None
+    ) -> PacketResult:
         """Разбирает и применяет одну датаграмму. Возвращает :class:`PacketResult`.
 
         Некорректные датаграммы не роняют обработчик: счётчик + лог.
+
+        Args:
+            data: сырые байты датаграммы.
+            src_addr: IP отправителя (из ``recvfrom``); ``None`` — фикстура
+                или прямой вызов из теста. При заданном ``source_filter``
+                датаграммы от других адресов отбрасываются без разбора.
         """
         with self.stats.lock:
             self.stats.datagrams += 1
+
+        if (
+            self.source_filter is not None
+            and src_addr is not None
+            and src_addr != self.source_filter
+        ):
+            with self.stats.lock:
+                self.stats.source_filtered += 1
+            log.debug("filtered datagram from %s (allowed: %s)",
+                      src_addr, self.source_filter)
+            return PacketResult()
 
         try:
             parsed: ParsedPacket = parse_packet(data)
         except UnsupportedFormatError as exc:
             fmt = struct.unpack_from("<H", data, 0)[0] if len(data) >= 2 else -1
+            src = src_addr or "?"
             with self.stats.lock:
                 self.stats.format_errors += 1
                 self.stats.unsupported_formats.add(fmt)
             if self.on_format_warning is not None and fmt not in (EXPECTED_PACKET_FORMAT,):
                 try:
-                    self.on_format_warning(fmt)
+                    self.on_format_warning(fmt, src)
                 except Exception:  # noqa: BLE001
                     log.exception("on_format_warning failed")
-            log.warning("unsupported UDP format %s (%s)", fmt, exc)
+            log.warning("unsupported UDP format %s from %s (%s)", fmt, src, exc)
             return PacketResult()
         except Exception as exc:  # noqa: BLE001 — UDP-мусор не должен ронять цикл
             with self.stats.lock:

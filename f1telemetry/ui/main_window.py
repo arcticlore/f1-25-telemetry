@@ -45,7 +45,7 @@ class RecorderBridge(QObject):
     lap_completed = Signal(object)
     event_received = Signal(str, object)
     flashback_detected = Signal()
-    format_warning = Signal(int)
+    format_warning = Signal(int, str)  # формат, IP источника
     stats_updated = Signal(object)
 
 
@@ -174,7 +174,8 @@ class MainWindow(QMainWindow):
         rec.on_laps = lambda laps: self.bridge.lap_completed.emit(tuple(laps))
         rec.on_event = lambda code, data: self.bridge.event_received.emit(code, data)
         rec.on_flashback = lambda: self.bridge.flashback_detected.emit()
-        rec.on_format_warning = lambda fmt: self.bridge.format_warning.emit(int(fmt))
+        rec.on_format_warning = lambda fmt, src: self.bridge.format_warning.emit(
+            int(fmt), str(src))
         rec.on_stats = lambda s: self.bridge.stats_updated.emit(s)
         rec.start()
         self.recorder = rec
@@ -307,10 +308,11 @@ class MainWindow(QMainWindow):
         self.status.conn.setText("↻ flashback")
         self.status.conn.setStyleSheet(f"color: {COLORS['yellow']}; font-weight: bold;")
 
-    def _on_format_warning(self, fmt: int) -> None:
+    def _on_format_warning(self, fmt: int, src: str = "?") -> None:
         self.banner.setText(
-            f"Игра шлёт формат {fmt}, а приложение поддерживает 2025. "
-            "В игре: Настройки → UDP Telemetry → UDP Format = 2025."
+            f"Пакеты формата {fmt} от {src} (ожидается 2025) — "
+            "это не ваша игра или другое приложение. В игре: "
+            "Настройки → UDP Telemetry → UDP Format = 2025."
         )
         self.banner.show()
 

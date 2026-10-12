@@ -264,8 +264,8 @@ def test_garbage_does_not_break_state(tmp_path):
 def test_unsupported_format_counts_and_warns(tmp_path):
     s, rec = _make_rec(tmp_path)
     _run(s, rec, 0.5)
-    warnings: list[int] = []
-    rec.on_format_warning = warnings.append
+    warnings: list[tuple[int, str]] = []
+    rec.on_format_warning = lambda fmt, src: warnings.append((fmt, src))
 
     d = bytearray(next(iter(s.tick())))
     struct.pack_into("<H", d, 0, 2026)
@@ -274,4 +274,61 @@ def test_unsupported_format_counts_and_warns(tmp_path):
     rec.stop()
     assert snap["format_errors"] >= 1
     assert 2026 in snap["unsupported_formats"]
-    assert warnings == [2026]
+    assert warnings == [(2026, "?")]
+
+
+def test_status_backfill_queues_update(tmp_path):
+    """Car Status с новым compound ставит backfill для уже записанных кругов."""
+    from types import SimpleNamespace
+
+    s, rec = _make_rec(tmp_path)
+    _run(s, rec, s.profile.lap_time_s * 2 + 1.0)
+    st = rec.state
+    i = st.player_car_index
+    assert st.cars.get(i) is not None
+    st._tyre_backfill.clear()  # «реальный compound пришёл позже»
+
+    def mk(actual: int, visual: int, age: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            m_actualTyreCompound=actual, m_visualTyreCompound=visual,
+            m_tyresAgeLaps=age, m_fuelInTank=50.0, m_fuelRemainingLaps=10.0,
+            m_ersStoreEnergy=0.0, m_ersDeployedThisLap=0.0,
+            m_ersHarvestedThisLapMGUK=0.0, m_ersHarvestedThisLapMGUH=0.0,
+            m_enginePowerICE=0.0, m_enginePowerMGUK=0.0, m_drsAllowed=1,
+        )
+
+    pkt = SimpleNamespace(m_carStatusData=[mk(0, 0, 0)] * 22)
+    pkt.m_carStatusData = [mk(18, 17, 2) for _ in range(22)]
+    st._on_status(pkt)
+    ops = [(op, args) for op, args, _kw in st._ops if op == "backfill_lap_tyres"]
+    uid = int(st.session_uid)
+    lap_num = st.cars[i].lap_num
+    assert ops == [("backfill_lap_tyres", (uid, i, 18, 17, lap_num))]
+    rec.stop()
+
+
+def test_draft_session_not_created_without_participants(tmp_path):
+    """Session без Participants с активными машинами не создаёт строку в БД."""
+    s, rec = _make_rec(tmp_path)
+    datagrams: list[bytes] = []
+    for _ in range(6):
+        datagrams.extend(s.tick())
+
+    # «черновик меню»: всё, кроме Participants (packetId=4)
+    rec.feed([d for d in datagrams if d[6] != 4])
+    rec._flush_writes(sync=True)
+    db = tmp_path / "db.sqlite"
+    if db.exists():  # вор создаёт файл лениво; при черновике его может и не быть
+        st = Storage(db, read_only=True)
+        assert st.list_sessions() == []
+        st.close()
+
+    # Participants с активными машинами — сессия появляется
+    rec.feed([d for d in datagrams if d[6] == 4][:1])
+    rec._flush_writes(sync=True)
+    st = Storage(tmp_path / "db.sqlite", read_only=True)
+    sessions = st.list_sessions()
+    assert len(sessions) == 1
+    assert sessions[0].num_cars == 22
+    st.close()
+    rec.stop()

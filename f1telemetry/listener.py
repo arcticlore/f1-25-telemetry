@@ -68,7 +68,9 @@ class Listener(threading.Thread):
         self.recv_buffer = recv_buffer
         self.on_error = on_error
         self.stats = ListenerStats()
-        self.queue: queue.Queue[bytes | None] = queue.Queue(maxsize=max_queue)
+        self.queue: queue.Queue[tuple[bytes, str] | None] = queue.Queue(
+            maxsize=max_queue
+        )
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._closed = False
@@ -116,7 +118,7 @@ class Listener(threading.Thread):
         self.stats.started_at = time.time()
         while not self._stop.is_set():
             try:
-                data, _addr = self._sock.recvfrom(self.recv_buffer)
+                data, addr = self._sock.recvfrom(self.recv_buffer)
             except socket.timeout:
                 continue
             except OSError as exc:
@@ -134,25 +136,30 @@ class Listener(threading.Thread):
             self.stats.bytes_received += len(data)
             self.stats.last_datagram_at = time.time()
             try:
-                self.queue.put_nowait(data)
+                self.queue.put_nowait((data, addr[0]))
             except queue.Full:
                 # Отбрасываем самую старую датаграмму: лучше иметь свежие.
                 self.stats.queue_drops += 1
                 try:
                     self.queue.get_nowait()
-                    self.queue.put_nowait(data)
+                    self.queue.put_nowait((data, addr[0]))
                 except (queue.Empty, queue.Full):  # pragma: no cover
                     pass
 
-    def get(self, timeout: float = 0.1) -> bytes | None:
-        """Забирает датаграмму из очереди (``None`` по таймауту)."""
+    def get(self, timeout: float = 0.1) -> tuple[bytes, str] | None:
+        """Забирает датаграмму из очереди (``None`` по таймауту).
+
+        Returns:
+            ``(data, src_ip)`` — сырые байты и IP-адрес отправителя
+            (нужен для ``--source-filter`` и диагностики чужих пакетов).
+        """
         try:
             return self.queue.get(timeout=timeout)
         except queue.Empty:
             return None
 
-    def __iter__(self) -> Iterator[bytes]:
-        """Итерирует датаграммы до остановки потока."""
+    def __iter__(self) -> Iterator[tuple[bytes, str]]:
+        """Итерирует ``(data, src_ip)`` до остановки потока."""
         while not self._stop.is_set() or not self.queue.empty():
             item = self.get(timeout=0.2)
             if item is not None:

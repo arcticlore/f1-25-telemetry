@@ -42,7 +42,7 @@ def test_listener_binds_and_receives():
         while len(got) < 2 and time.time() < deadline:
             d = lis.get(timeout=0.2)
             if d is not None:
-                got.append(d)
+                got.append(d[0])
         assert got == [b"hello", b"world"]
         assert lis.stats.packets_received == 2
         assert lis.stats.bytes_received == 10
@@ -65,7 +65,7 @@ def test_listener_drops_oldest_when_queue_full():
             d = lis.get(timeout=0.05)
             if d is None:
                 break
-            got.append(d)
+            got.append(d[0])
         assert got  # самые свежие датаграммы сохранены
         assert got[-1] in (b"c", b"d")
     finally:
@@ -81,7 +81,7 @@ def test_listener_iter_stops():
         out = []
         deadline = time.time() + 2.0
         for d in lis:
-            out.append(d)
+            out.append(d[0])
             if len(out) >= 1 or time.time() > deadline:
                 break
         assert out == [b"x"]
@@ -182,3 +182,49 @@ def test_recorder_callbacks(tmp_path):
     assert laps and any(0 in t for t in laps)
     assert "SSTA" in events
     assert "FTLP" in events
+
+
+def test_listener_passes_source_ip():
+    """Очередь Listener несёт (data, src_ip) — IP нужен для --source-filter."""
+    port = _free_udp_port()
+    lis = Listener("127.0.0.1", port)
+    lis.start()
+    try:
+        _send("127.0.0.1", port, [b"z"])
+        item = None
+        deadline = time.time() + 2.0
+        while item is None and time.time() < deadline:
+            item = lis.get(timeout=0.2)
+        assert item is not None
+        data, src = item
+        assert data == b"z"
+        assert src == "127.0.0.1"
+    finally:
+        lis.stop()
+
+
+def test_source_filter_and_warning_carries_src(tmp_path):
+    """--source-filter: чужой IP отбрасывается, ворнинг несёт IP источника."""
+    from f1telemetry.recorder import Recorder
+
+    rec = Recorder(tmp_path / "sf.sqlite", source_filter="10.0.0.5")
+    warnings: list[tuple[int, str]] = []
+    rec.on_format_warning = lambda fmt, src: warnings.append((fmt, src))
+
+    # чужой IP: отброшено без разбора
+    rec.handle_datagram(b"\xff" * 45, src_addr="192.168.1.7")
+    snap = rec.stats.snapshot()
+    assert snap["source_filtered"] == 1
+    assert snap["format_errors"] == 0
+    assert warnings == []
+
+    # свой IP: разбирается (формат 0xffff → UnsupportedFormatError) + IP в ворнинге
+    rec.handle_datagram(b"\xff" * 45, src_addr="10.0.0.5")
+    snap = rec.stats.snapshot()
+    assert snap["source_filtered"] == 1
+    assert snap["format_errors"] == 1
+    assert warnings == [(0xFFFF, "10.0.0.5")]
+
+    # без src_addr (feed/фикстура) фильтр не действует
+    rec.handle_datagram(b"\xff" * 45)
+    assert rec.stats.snapshot()["format_errors"] == 2

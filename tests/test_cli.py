@@ -163,3 +163,11 @@ def test_anonymize_missing_db(tmp_path, capsys):
     rc = cli.main(["anonymize", "--db", str(tmp_path / "nope.sqlite")])
     assert rc == 2
     assert "db not found" in capsys.readouterr().err
+
+
+def test_record_source_filter_flag():
+    args = cli.build_parser().parse_args(
+        ["record", "--source-filter", "192.168.0.10"])
+    assert args.source_filter == "192.168.0.10"
+    args = cli.build_parser().parse_args(["record"])
+    assert args.source_filter is None

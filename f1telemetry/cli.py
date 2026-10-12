@@ -89,6 +89,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         sample_hz=args.sample_hz,
         detail_hz=args.detail_hz,
         status_hz=args.status_hz,
+        source_filter=args.source_filter,
     )
     _install_print_hooks(rec, quiet=args.quiet)
     try:
@@ -97,6 +98,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         print(f"cannot listen on {host}:{port}: {exc}", file=sys.stderr)
         return 2
     print(f"listening on {host}:{port} -> {db}", flush=True)
+    if args.source_filter:
+        print(f"source filter: only {args.source_filter}", flush=True)
     deadline = (
         time.monotonic() + args.seconds
         if args.seconds and args.seconds > 0
@@ -320,9 +323,9 @@ def _install_print_hooks(rec: Recorder, *, quiet: bool = False) -> None:
     def on_event(code: str, details: dict[str, Any]) -> None:
         print(f"[event] {code} {details}", flush=True)
 
-    def on_format_warning(fmt: int) -> None:
+    def on_format_warning(fmt: int, src: str = "?") -> None:
         print(
-            f"[warning] game sends UDP format {fmt}, expected 2025 — "
+            f"[warning] UDP format {fmt} from {src}, expected 2025 — "
             "set in game: Settings → UDP Telemetry → UDP Format = 2025",
             file=sys.stderr, flush=True,
         )
@@ -368,6 +371,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--sample-hz", type=float, default=20.0)
     r.add_argument("--detail-hz", type=float, default=10.0)
     r.add_argument("--status-hz", type=float, default=5.0)
+    r.add_argument("--source-filter", default=None, metavar="IP",
+                   help="принимать только датаграммы с этого IP "
+                        "(адрес игровой машины)")
     r.add_argument("--quiet", action="store_true")
     r.set_defaults(func=cmd_record)
 

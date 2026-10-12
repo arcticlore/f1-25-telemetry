@@ -171,8 +171,9 @@ def test_format_banner(tmp_path):
     from f1telemetry.ui.main_window import MainWindow
     db = tmp_path / "b.sqlite"
     win = MainWindow(db, autostart=False)
-    win._on_format_warning(2026)
-    assert win.banner.isVisible() or "2026" in win.banner.text()
+    win._on_format_warning(2026, "192.168.0.99")
+    text = win.banner.text()
+    assert "2026" in text and "192.168.0.99" in text
     win.close()
 
 

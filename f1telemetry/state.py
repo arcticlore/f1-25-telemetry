@@ -345,6 +345,7 @@ class SessionState:
         self._uid_zero_warned = False
         self._stint_start_lap: dict[int, int] = {}
         self._stint_lap_times: dict[int, list[int]] = {}
+        self._tyre_backfill: dict[int, int] = {}
 
         # --- очередь записи ---
         self._ops: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
@@ -633,6 +634,13 @@ class SessionState:
 
         self.session_time = h.session_time
 
+        # Пока не пришли Participants с активными машинами — обрабатываем
+        # только сам Session-пакет и Participants: никаких laps/telemetry/
+        # events для «черновой» сессии из меню (иначе сироты без строки
+        # sessions).
+        if not self.participants and parsed.packet_id not in (1, 4):
+            return result
+
         match parsed.packet_id:
             case 1:
                 self._on_session(parsed.packet)
@@ -706,6 +714,7 @@ class SessionState:
         self.packets_total = 0
         self._stint_start_lap: dict[int, int] = {}
         self._stint_lap_times: dict[int, list[int]] = {}
+        self._tyre_backfill.clear()
 
     def _car(self, idx: int) -> _CarLap:
         st = self.cars.get(idx)
@@ -718,6 +727,11 @@ class SessionState:
         self._ops.append((op, args, kwargs))
 
     def _queue_session_row(self) -> None:
+        # Черновик меню: без участников сессию в БД не создаём — ждём
+        # Participants с numActiveCars > 0 (иначе в браузере появляются
+        # пустые сессии с num_cars=None).
+        if not self.participants:
+            return
         meta = self.session_meta
         self._queue(
             "upsert_session",
@@ -793,6 +807,9 @@ class SessionState:
         self._queue_session_row()
 
     def _on_participants(self, pkt: PacketParticipants) -> None:
+        if int(pkt.m_numActiveCars) <= 0:
+            # лобби/меню: активных машин нет — сессию не создаём
+            return
         uid = int(self.session_uid or 0)
         for i, p in enumerate(pkt.m_participants):
             raw_name = bytes(p.m_name).split(b"\x00", 1)[0].decode("utf-8", "replace")
@@ -1182,6 +1199,14 @@ class SessionState:
             st.compound_actual = compound
             st.compound_visual = int(s.m_visualTyreCompound)
             st.tyre_age = age
+            # Круги могли записаться с compound=0 (статус пришёл позже) —
+            # дозаполняем уже записанные строки этого же стинта.
+            if compound and self._tyre_backfill.get(i) != compound:
+                self._tyre_backfill[i] = compound
+                self._queue(
+                    "backfill_lap_tyres", uid, i, compound,
+                    int(s.m_visualTyreCompound), st.lap_num,
+                )
             if st.fuel_at_start is None:
                 st.fuel_at_start = float(s.m_fuelInTank)
             st.ers_deployed_max = max(st.ers_deployed_max, float(s.m_ersDeployedThisLap))

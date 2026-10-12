@@ -454,3 +454,26 @@ def test_anonymize(tmp_path):
     # повторный вызов идемпотентен
     assert st.anonymize(uid) == 1
     st.close()
+
+
+def test_backfill_lap_tyres(tmp_path):
+    """backfill_lap_tyres: compound=0 → реальный, чужие/поздние строки не трогает."""
+    st = Storage(tmp_path / "bf.sqlite")
+    st.upsert_session(UID)
+    for lap, ca, cv in ((1, 0, 0), (2, 18, 17), (5, 0, 0)):
+        st.upsert_lap(LapRecord(
+            session_uid=UID, car_index=0, lap_num=lap, lap_time_ms=90000 + lap,
+            compound_actual=ca, compound_visual=cv,
+        ))
+    st.commit()
+    n = st.backfill_lap_tyres(UID, 0, 18, 17, upto_lap=3)
+    st.commit()
+    assert n == 1  # только lap 1: lap 2 уже реальный, lap 5 вне окна
+    by = {l["lap_num"]: l for l in st.laps(UID, 0)}
+    assert by[1]["compound_actual"] == 18
+    assert by[1]["compound_visual"] == 17
+    assert by[2]["compound_actual"] == 18
+    assert by[5]["compound_actual"] == 0
+    # идемпотентно: повторный вызов ничего не меняет
+    assert st.backfill_lap_tyres(UID, 0, 18, 17, upto_lap=3) == 0
+    st.close()

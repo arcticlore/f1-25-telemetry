@@ -622,6 +622,39 @@ class Storage:
             self.conn.execute(f"DELETE FROM {t} WHERE {key}=?", (session_uid,))
         return len(tables)
 
+    def backfill_lap_tyres(
+        self,
+        session_uid: int,
+        car_index: int,
+        compound_actual: int,
+        compound_visual: int,
+        upto_lap: int,
+    ) -> int:
+        """Дозаполняет compound в уже записанных кругах.
+
+        Игра может слать ``actualTyreCompound=0`` в первые круги — круги
+        пишутся с compound=0, а первый «настоящий» Car Status приходит позже.
+        Обновляются только строки с ``compound_actual=0`` и ``lap_num<=upto_lap``
+        (значения других стинтов не трогаются). Возвращает число обновлённых строк.
+
+        Args:
+            session_uid: сессия (u64, знаковый int64 в SQLite).
+            car_index: машина.
+            compound_actual: фактический compound (16=C5 … 22=C6, 7=Inter, 8=Wet).
+            compound_visual: визуальный compound (16=Soft, 17=Medium, 18=Hard …).
+            upto_lap: обновить круги с номером ≤ этого.
+
+        Returns:
+            Число обновлённых строк ``laps``.
+        """
+        cur = self.conn.execute(
+            "UPDATE laps SET compound_actual=?, compound_visual=?"
+            " WHERE session_uid=? AND car_index=?"
+            " AND compound_actual=0 AND lap_num<=?",
+            (compound_actual, compound_visual, session_uid, car_index, upto_lap),
+        )
+        return int(cur.rowcount)
+
     def anonymize(self, session_uid: int | None = None) -> int:
         """Анонимизация: имена участников → «Driver N», name из событий удаляется.
 
