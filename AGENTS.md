@@ -499,3 +499,41 @@ python tools/simulate.py --laps 3 --record-fixture tests/fixtures/session_3laps.
 - [ ] `python run.py` показывает живую приборку и графики на данных симулятора.
 - [ ] README с настройкой UDP в игре, скриншотом и описанием схемы БД.
 - [ ] Код залит на GitHub.
+
+---
+
+## 9. Заметки по реализации (отклонения от раздела 3 — НЕ редактировать раздел 3 задним числом)
+
+1. **Car Damage = 1041 байт, а не 1129.** В PDF v3 «Data Output from F1® 25»
+   указан размер 1041 (29 + 22×46) — это корректный размер F1 25 (структура из
+   F1 24: 4×f32 + 30×u8 на машину). Значение 1129 в разделе 3.2 выше — ошибка
+   предыдущей редакции (два лишних u8 на машину). `PACKET_SIZES[CarDamage]=1041`;
+   в `constants.py` лежит константа `CAR_DAMAGE_SIZE_AGENTS_DOC = 1129` для
+   сверки. Пакеты неверной длины не роняют приём: счётчик ошибок + лог.
+
+2. **Таблицы шин разнесены на три**: `TYRE_COMPOUND_ACTUAL`, `TYRE_COMPOUND_VISUAL`
+   и короткие метки `TYRE_COMPOUND_SHORT` (Soft/Medium/Hard/Inter/Wet) для UI.
+
+3. **`INFRINGEMENT_TYPES` — только концы диапазона** (0 и 46) по правилу
+   «не выдумывать». Остальные ID отображаются как `#N`.
+
+4. **`SESSION_TYPES` / `TRACKS` / `TEAMS`** — имена таблиц (не `*_NAMES`).
+
+5. **Session UID — u64.** Qt-сигнал `Signal(int)` — 32-битный: в GUI мост
+   использует `Signal(object)` для `session_changed`.
+
+6. **ctypes-порядок размерностей**: `u8 * MAX_CARS * 50` соответствует C
+   `uint8_t[50][22]` (в Python это [22][50]). Ошибка приводила к мусору в
+   PacketLapPositions.
+
+7. **`SessionState.recent_laps`** — deque последних завершённых кругов
+   (LapRecord) для наполнения таблицы кругов в GUI; GUI читает через
+   `take_recent_laps()`.
+
+8. **`requirements.txt` не ведётся** — источник истины `pyproject.toml` +
+   закоммиченный `uv.lock`.
+
+9. **Фикстура `tests/fixtures/session_short.bin`** — Silverstone, гонка, 22
+   машины, 2 круга по короткой трассе (400 м), 10 Гц. Генерируется командой:
+   `python tools/simulate.py --laps 2 --hz 10 --cars 22 --track-length 400
+   --record-fixture tests/fixtures/session_short.bin`
