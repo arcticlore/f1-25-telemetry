@@ -103,6 +103,7 @@ class LiveSnapshot:
     # --- сессия ---
     session_uid: int | None = None
     session_time: float = 0.0
+    secondary_car_index: int = 255   # 255 = второго игрока нет (не splitscreen)
     track_id: int | None = None
     track_name: str | None = None
     session_type: int | None = None
@@ -295,9 +296,8 @@ class SessionState:
         self.max_pending_ops = max_pending_ops
 
         ring_hz = max(10.0, self.sample_hz)
-        self._ring: deque[TraceSample] = deque(
-            maxlen=int(ring_hz * buffer_seconds)
-        )
+        self._ring_maxlen = int(ring_hz * buffer_seconds)
+        self._rings: dict[int, deque[TraceSample]] = {}
         self._max_history_laps = max_history_laps
 
         # --- сессия ---
@@ -313,14 +313,16 @@ class SessionState:
         self.participants: dict[int, dict[str, Any]] = {}
         self.finals: dict[int, dict[str, Any]] = {}
         self.best_lap_ms: dict[int, int] = {}
+        self.recent_laps: deque[LapRecord] = deque(maxlen=64)
         self._car_history: dict[int, list[dict[str, Any]]] = {}
         self._laps_written: dict[int, set[int]] = {}
 
-        # --- последний известный «сырой» срез игрока ---
-        self._telem: CarTelemetryData | None = None
-        self._status: CarStatusData | None = None
-        self._damage: CarDamageData | None = None
-        self._motion: dict[str, float] = {}
+        # --- последний известный «сырой» срез по машинам (splitscreen: игрок
+        # и второй игрок пишутся одинаково) ---
+        self._car_telem: dict[int, CarTelemetryData] = {}
+        self._car_status: dict[int, CarStatusData] = {}
+        self._car_damage: dict[int, CarDamageData] = {}
+        self._car_motion: dict[int, dict[str, float]] = {}
         self._motion_ex: dict[str, float] = {}
         self._suggested_gear: int = 0
         self._drs_allowed: int = 0
@@ -357,19 +359,64 @@ class SessionState:
         """True, если известна сессия (пришёл хотя бы один пакет с UID)."""
         return self.session_uid is not None
 
-    def trace(self, max_points: int | None = None) -> list[TraceSample]:
-        """Кольцевой буфер живого графика (старые -> новые)."""
-        if max_points is None or max_points >= len(self._ring):
-            return list(self._ring)
-        return list(self._ring)[-max_points:]
+    def tracked_cars(self) -> tuple[int, ...]:
+        """Индексы машин, для которых пишется телеметрия.
 
-    def snapshot(self) -> LiveSnapshot:
-        """Мгновенный срез для GUI (потокобезопасно на уровне GIL)."""
+        Всегда игрок (``m_playerCarIndex``); в режиме splitscreen — также
+        второй игрок (``m_secondaryPlayerCarIndex``, 255 = второго нет).
+        """
+        out: list[int] = []
+        if 0 <= self.player_car_index < MAX_CARS:
+            out.append(self.player_car_index)
+        sec = self.secondary_player_car_index
+        if sec != 255 and 0 <= sec < MAX_CARS and sec not in out:
+            out.append(sec)
+        return tuple(out)
+
+    def _ring_for(self, car_index: int) -> deque[TraceSample]:
+        """Кольцевой буфер живого графика конкретной машины."""
+        ring = self._rings.get(car_index)
+        if ring is None:
+            ring = deque(maxlen=self._ring_maxlen)
+            self._rings[car_index] = ring
+        return ring
+
+    @property
+    def _ring(self) -> deque[TraceSample]:
+        """Кольцевой буфер игрока (совместимость: ``state._ring``)."""
+        return self._ring_for(self.player_car_index)
+
+    def trace(
+        self, car_index: int | None = None, max_points: int | None = None
+    ) -> list[TraceSample]:
+        """Кольцевой буфер живого графика (старые -> новые).
+
+        Args:
+            car_index: машина (``None`` — игрок; в splitscreen у каждого
+                игрока свой буфер).
+            max_points: ограничение числа последних точек.
+        """
+        ring = self._ring_for(
+            self.player_car_index if car_index is None else int(car_index)
+        )
+        if max_points is None or max_points >= len(ring):
+            return list(ring)
+        return list(ring)[-max_points:]
+
+    def snapshot(self, car_index: int | None = None) -> LiveSnapshot:
+        """Мгновенный срез для GUI (потокобезопасно на уровне GIL).
+
+        Args:
+            car_index: машина для среза (``None`` — игрок; в splitscreen
+                можно запросить второго игрока).
+        """
         snap = LiveSnapshot()
         snap.session_uid = self.session_uid
         snap.packets_total = self.packets_total
         snap.parse_errors = self.parse_errors
         snap.lost_frames = self.lost_frames
+        snap.secondary_car_index = self.secondary_player_car_index
+        idx = self.player_car_index if car_index is None else int(car_index)
         now = time.monotonic()
         if self._last_packet_monotonic is not None:
             snap.last_packet_age_s = now - self._last_packet_monotonic
@@ -392,9 +439,9 @@ class SessionState:
         snap.safety_car_status = int(meta.get("safety_car_status") or 0)
         snap.num_cars = len(self.participants) or int(meta.get("num_cars") or 0)
 
-        car = self.cars.get(self.player_car_index)
-        part = self.participants.get(self.player_car_index, {})
-        snap.car_index = self.player_car_index
+        car = self.cars.get(idx)
+        part = self.participants.get(idx, {})
+        snap.car_index = idx
         snap.driver_name = str(part.get("name") or "")
         snap.team_name = str(part.get("team_name") or "")
 
@@ -409,13 +456,13 @@ class SessionState:
             snap.sector = car.sector
             snap.current_lap_ms = car.current_lap_ms
             snap.last_lap_ms = car.last_lap_ms
-            snap.best_lap_ms = self.best_lap_ms.get(self.player_car_index, 0)
+            snap.best_lap_ms = self.best_lap_ms.get(idx, 0)
             snap.s1_ms = car.s1_ms
             snap.s2_ms = car.s2_ms
             snap.s3_ms = (
                 max(0, car.last_lap_ms - car.s1_ms - car.s2_ms) if car.last_lap_ms else 0
             )
-            hist = self._car_history.get(self.player_car_index)
+            hist = self._car_history.get(idx)
             if hist:
                 best = best_sectors(hist)
                 snap.theoretical_ms = best["theoretical"]
@@ -433,7 +480,7 @@ class SessionState:
             snap.tyre_visual_name = name_of(TYRE_COMPOUND_VISUAL, car.compound_visual)
             snap.tyre_age_laps = car.tyre_age
 
-        t = self._telem
+        t = self._car_telem.get(idx)
         if t is not None:
             snap.speed_kmh = float(t.m_speed)
             snap.throttle = float(t.m_throttle)
@@ -451,7 +498,7 @@ class SessionState:
             snap.brake_temp_c = tuple(int(x) for x in t.m_brakesTemperature)  # type: ignore[assignment]
             snap.surface = tuple(int(x) for x in t.m_surfaceType)  # type: ignore[assignment]
 
-        s = self._status
+        s = self._car_status.get(idx)
         if s is not None:
             snap.fuel_kg = float(s.m_fuelInTank)
             snap.fuel_capacity_kg = float(s.m_fuelCapacity)
@@ -466,7 +513,7 @@ class SessionState:
             snap.drs_allowed = int(s.m_drsAllowed)
             snap.fia_flag = int(s.m_vehicleFiaFlags)
 
-        m = self._motion
+        m = self._car_motion.get(idx)
         if m:
             snap.pos_x = m.get("x", 0.0)
             snap.pos_y = m.get("y", 0.0)
@@ -482,7 +529,7 @@ class SessionState:
         if ex:
             snap.front_wheels_angle = ex.get("front_wheels_angle", 0.0)
 
-        d = self._damage
+        d = self._car_damage.get(idx)
         if d is not None:
             snap.tyre_wear_pct = tuple(float(x) for x in d.m_tyresWear)  # type: ignore[assignment]
             snap.tyre_damage_pct = tuple(int(x) for x in d.m_tyresDamage)  # type: ignore[assignment]
@@ -494,6 +541,12 @@ class SessionState:
             snap.engine_ice_wear = int(d.m_engineICEWear)
 
         return snap
+
+    def take_recent_laps(self) -> list[LapRecord]:
+        """Возвращает и очищает буфер завершённых кругов (для GUI)."""
+        out = list(self.recent_laps)
+        self.recent_laps.clear()
+        return out
 
     def drain_writes(self) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
         """Забирает накопленные операции записи ``(op, args, kwargs)``.
@@ -622,12 +675,12 @@ class SessionState:
         self.best_lap_ms.clear()
         self._car_history.clear()
         self._laps_written.clear()
-        self._telem = None
-        self._status = None
-        self._damage = None
-        self._motion = {}
+        self._car_telem.clear()
+        self._car_status.clear()
+        self._car_damage.clear()
+        self._car_motion.clear()
         self._motion_ex = {}
-        self._ring.clear()
+        self._rings.clear()
         self._next_sample_t = 0.0
         self._next_detail_t = 0.0
         self._next_status_t = 0.0
@@ -831,8 +884,9 @@ class SessionState:
                 st.s1_ms = 0
                 st.s2_ms = 0
                 st.invalid = 0
+                stat_i = self._car_status.get(i)
                 st.fuel_at_start = (
-                    float(self._status.m_fuelInTank) if self._status is not None else None
+                    float(stat_i.m_fuelInTank) if stat_i is not None else None
                 )
             else:
                 # секторные границы внутри круга
@@ -882,7 +936,7 @@ class SessionState:
         valid = 0 if st.invalid else 1
 
         samples = (
-            st.telemetry_samples if car_idx == self.player_car_index else []
+            st.telemetry_samples if car_idx in self.tracked_cars() else []
         )
         agg = lap_aggregates(samples) if samples else {
             "top_speed_kmh": st.top_speed,
@@ -916,6 +970,7 @@ class SessionState:
             full_throttle_pct=agg["full_throttle_pct"],
         )
         self._queue("upsert_lap", rec)
+        self.recent_laps.append(rec)
         completed.append(car_idx)
 
         # лучший круг
@@ -947,19 +1002,24 @@ class SessionState:
 
         written = self._laps_written.setdefault(car_idx, set())
         written.add(st.lap_num)
-        if car_idx == self.player_car_index:
-            self._maybe_flush_stint()
+        if car_idx in self.tracked_cars():
+            self._maybe_flush_stint(car_idx)
 
-    def _maybe_flush_stint(self) -> None:
-        """Пересчитывает агрегаты стинта игрока (при смене шины или периодически)."""
-        hist = self._car_history.get(self.player_car_index, [])
+    def _maybe_flush_stint(self, car_index: int | None = None) -> None:
+        """Пересчитывает агрегаты стинта (при смене шины или периодически).
+
+        Args:
+            car_index: машина (по умолчанию — игрок).
+        """
+        idx = self.player_car_index if car_index is None else int(car_index)
+        hist = self._car_history.get(idx, [])
         if not hist:
             return
         stints = stint_degradation(hist)
         uid = int(self.session_uid or 0)
         for d in stints:
             self._queue(
-                "upsert_stint", uid, self.player_car_index, d.stint_index,
+                "upsert_stint", uid, idx, d.stint_index,
                 start_lap=d.start_lap, end_lap=d.end_lap,
                 compound_actual=d.compound_actual, compound_visual=d.compound_visual,
                 laps_count=d.laps_count, avg_lap_ms=d.avg_lap_ms,
@@ -968,160 +1028,176 @@ class SessionState:
 
     def _flush_stints(self, force: bool = False) -> None:
         if force:
-            self._maybe_flush_stint()
+            for idx in self.tracked_cars():
+                self._maybe_flush_stint(idx)
 
     def _on_telemetry(self, pkt: PacketCarTelemetry) -> None:
-        i = self.player_car_index
-        if i >= MAX_CARS:
-            return
-        t = pkt.m_carTelemetryData[i]
-        self._telem = t
         self._suggested_gear = int(pkt.m_suggestedGear)
-
-        st = self.cars.get(i)
-        if st is None:
-            return
-
         t_now = self.session_time
-        dt = 0.0
-        if st.last_telem_t is not None:
-            dt = max(0.0, t_now - st.last_telem_t)
-        st.last_telem_t = t_now
-
-        speed = float(t.m_speed)
-        st.top_speed = max(st.top_speed, speed)
-        st.thr_sum += float(t.m_throttle)
-        st.thr_n += 1
-        st.brake_s += dt if float(t.m_brake) > 0.02 else 0.0
-        st.full_thr_s += dt if float(t.m_throttle) > 0.95 else 0.0
-        st.distance_samples.append(DistanceSample(st.lap_distance, speed))
-        st.telemetry_samples.append({
-            "speed_kmh": speed,
-            "throttle": float(t.m_throttle),
-            "brake": float(t.m_brake),
-        })
-        if len(st.distance_samples) > 4000:
-            del st.distance_samples[:2000]
-            del st.telemetry_samples[:2000]
-
+        tracked = self.tracked_cars()
+        if not tracked:
+            return
         uid = int(self.session_uid or 0)
-        if t_now >= self._next_sample_t:
+
+        # глобальные ворота частоты: срабатывают один раз на пакет,
+        # строку пишем для каждого отслеживаемого игрока
+        do_sample = t_now >= self._next_sample_t
+        if do_sample:
             self._next_sample_t = t_now + self._sample_dt
             flash = 1 if self._flashback_until >= 0 else 0
-            self._pending_telemetry.append((
-                uid, i, st.lap_num, st.sample_idx,
-                float(t_now), float(st.lap_distance),
-                speed, float(t.m_throttle), float(t.m_brake), float(t.m_steer),
-                int(t.m_gear), int(t.m_engineRPM), int(t.m_drs), self._status.m_ersDeployMode if self._status else 0,
-                float(self._motion.get("x", 0.0)),
-                float(self._motion.get("y", 0.0)),
-                float(self._motion.get("z", 0.0)),
-                float(self._motion.get("vx", 0.0)),
-                float(self._motion.get("vy", 0.0)),
-                float(self._motion.get("vz", 0.0)),
-                float(self._motion.get("g_lat", 0.0)),
-                float(self._motion.get("g_lon", 0.0)),
-                float(self._motion.get("g_vert", 0.0)),
-                float(self._motion.get("yaw", 0.0)),
-                float(self._motion.get("pitch", 0.0)),
-                float(self._motion.get("roll", 0.0)),
-                flash,
-            ))
-            st.sample_idx += 1
-
-            self._ring.append(TraceSample(
-                session_time=float(t_now),
-                lap_distance_m=float(st.lap_distance),
-                speed_kmh=speed,
-                throttle=float(t.m_throttle),
-                brake=float(t.m_brake),
-                gear=int(t.m_gear),
-                rpm=int(t.m_engineRPM),
-                drs=int(t.m_drs),
-                lap_num=st.lap_num,
-                flashback=flash,
-            ))
-
-        if t_now >= self._next_detail_t:
+        do_detail = t_now >= self._next_detail_t
+        if do_detail:
             self._next_detail_t = t_now + self._detail_dt
-            d = self._damage
-            wear = d.m_tyresWear if d is not None else (0.0, 0.0, 0.0, 0.0)
-            dmg = d.m_tyresDamage if d is not None else (0, 0, 0, 0)
-            self._pending_detail.append((
-                uid, i, st.lap_num, st.detail_idx,
-                float(t.m_brakesTemperature[0]), float(t.m_brakesTemperature[1]),
-                float(t.m_brakesTemperature[2]), float(t.m_brakesTemperature[3]),
-                float(t.m_tyresSurfaceTemperature[0]), float(t.m_tyresSurfaceTemperature[1]),
-                float(t.m_tyresSurfaceTemperature[2]), float(t.m_tyresSurfaceTemperature[3]),
-                float(t.m_tyresInnerTemperature[0]), float(t.m_tyresInnerTemperature[1]),
-                float(t.m_tyresInnerTemperature[2]), float(t.m_tyresInnerTemperature[3]),
-                float(t.m_tyresPressure[0]), float(t.m_tyresPressure[1]),
-                float(t.m_tyresPressure[2]), float(t.m_tyresPressure[3]),
-                float(wear[0]), float(wear[1]), float(wear[2]), float(wear[3]),
-                float(dmg[0]), float(dmg[1]), float(dmg[2]), float(dmg[3]),
-                int(t.m_surfaceType[0]), int(t.m_surfaceType[1]),
-                int(t.m_surfaceType[2]), int(t.m_surfaceType[3]),
-                float(t.m_engineTemperature),
-            ))
-            st.detail_idx += 1
+
+        for i in tracked:
+            t = pkt.m_carTelemetryData[i]
+            self._car_telem[i] = t
+
+            st = self.cars.get(i)
+            if st is None:
+                continue
+
+            dt = 0.0
+            if st.last_telem_t is not None:
+                dt = max(0.0, t_now - st.last_telem_t)
+            st.last_telem_t = t_now
+
+            speed = float(t.m_speed)
+            st.top_speed = max(st.top_speed, speed)
+            st.thr_sum += float(t.m_throttle)
+            st.thr_n += 1
+            st.brake_s += dt if float(t.m_brake) > 0.02 else 0.0
+            st.full_thr_s += dt if float(t.m_throttle) > 0.95 else 0.0
+            st.distance_samples.append(DistanceSample(st.lap_distance, speed))
+            st.telemetry_samples.append({
+                "speed_kmh": speed,
+                "throttle": float(t.m_throttle),
+                "brake": float(t.m_brake),
+            })
+            if len(st.distance_samples) > 4000:
+                del st.distance_samples[:2000]
+                del st.telemetry_samples[:2000]
+
+            if do_sample:
+                stat = self._car_status.get(i)
+                m = self._car_motion.get(i, {})
+                self._pending_telemetry.append((
+                    uid, i, st.lap_num, st.sample_idx,
+                    float(t_now), float(st.lap_distance),
+                    speed, float(t.m_throttle), float(t.m_brake), float(t.m_steer),
+                    int(t.m_gear), int(t.m_engineRPM), int(t.m_drs),
+                    int(stat.m_ersDeployMode) if stat is not None else 0,
+                    float(m.get("x", 0.0)),
+                    float(m.get("y", 0.0)),
+                    float(m.get("z", 0.0)),
+                    float(m.get("vx", 0.0)),
+                    float(m.get("vy", 0.0)),
+                    float(m.get("vz", 0.0)),
+                    float(m.get("g_lat", 0.0)),
+                    float(m.get("g_lon", 0.0)),
+                    float(m.get("g_vert", 0.0)),
+                    float(m.get("yaw", 0.0)),
+                    float(m.get("pitch", 0.0)),
+                    float(m.get("roll", 0.0)),
+                    flash,
+                ))
+                st.sample_idx += 1
+
+                self._ring_for(i).append(TraceSample(
+                    session_time=float(t_now),
+                    lap_distance_m=float(st.lap_distance),
+                    speed_kmh=speed,
+                    throttle=float(t.m_throttle),
+                    brake=float(t.m_brake),
+                    gear=int(t.m_gear),
+                    rpm=int(t.m_engineRPM),
+                    drs=int(t.m_drs),
+                    lap_num=st.lap_num,
+                    flashback=flash,
+                ))
+
+            if do_detail:
+                d = self._car_damage.get(i)
+                wear = d.m_tyresWear if d is not None else (0.0, 0.0, 0.0, 0.0)
+                dmg = d.m_tyresDamage if d is not None else (0, 0, 0, 0)
+                self._pending_detail.append((
+                    uid, i, st.lap_num, st.detail_idx,
+                    float(t.m_brakesTemperature[0]), float(t.m_brakesTemperature[1]),
+                    float(t.m_brakesTemperature[2]), float(t.m_brakesTemperature[3]),
+                    float(t.m_tyresSurfaceTemperature[0]), float(t.m_tyresSurfaceTemperature[1]),
+                    float(t.m_tyresSurfaceTemperature[2]), float(t.m_tyresSurfaceTemperature[3]),
+                    float(t.m_tyresInnerTemperature[0]), float(t.m_tyresInnerTemperature[1]),
+                    float(t.m_tyresInnerTemperature[2]), float(t.m_tyresInnerTemperature[3]),
+                    float(t.m_tyresPressure[0]), float(t.m_tyresPressure[1]),
+                    float(t.m_tyresPressure[2]), float(t.m_tyresPressure[3]),
+                    float(wear[0]), float(wear[1]), float(wear[2]), float(wear[3]),
+                    float(dmg[0]), float(dmg[1]), float(dmg[2]), float(dmg[3]),
+                    int(t.m_surfaceType[0]), int(t.m_surfaceType[1]),
+                    int(t.m_surfaceType[2]), int(t.m_surfaceType[3]),
+                    float(t.m_engineTemperature),
+                ))
+                st.detail_idx += 1
 
     def _on_status(self, pkt: PacketCarStatus) -> None:
-        i = self.player_car_index
-        if i >= MAX_CARS:
+        tracked = self.tracked_cars()
+        if not tracked:
             return
-        s = pkt.m_carStatusData[i]
-        self._status = s
-        self._drs_allowed = int(s.m_drsAllowed)
-
-        st = self.cars.get(i)
-        if st is None:
-            return
-
-        compound = int(s.m_actualTyreCompound)
-        age = int(s.m_tyresAgeLaps)
-        if st.compound_actual and compound and compound != st.compound_actual:
-            st.stint_index += 1
-        elif st.tyre_age and age < st.tyre_age:
-            # возраст шины уменьшился — новый комплект (пит-стоп)
-            st.stint_index += 1
-        st.compound_actual = compound
-        st.compound_visual = int(s.m_visualTyreCompound)
-        st.tyre_age = age
-        if st.fuel_at_start is None:
-            st.fuel_at_start = float(s.m_fuelInTank)
-        st.ers_deployed_max = max(st.ers_deployed_max, float(s.m_ersDeployedThisLap))
-
         uid = int(self.session_uid or 0)
-        if self.session_time >= self._next_status_t:
+        do_sample = self.session_time >= self._next_status_t
+        if do_sample:
             self._next_status_t = self.session_time + self._status_dt
-            self._pending_status.append((
-                uid, i, st.lap_num, st.status_idx,
-                float(s.m_fuelInTank), float(s.m_fuelRemainingLaps),
-                float(s.m_ersStoreEnergy), float(s.m_ersDeployedThisLap),
-                float(s.m_ersHarvestedThisLapMGUK) + float(s.m_ersHarvestedThisLapMGUH),
-                float(s.m_enginePowerICE), float(s.m_enginePowerMGUK),
-            ))
-            st.status_idx += 1
+
+        for i in tracked:
+            s = pkt.m_carStatusData[i]
+            self._car_status[i] = s
+            if i == self.player_car_index:
+                self._drs_allowed = int(s.m_drsAllowed)
+
+            st = self.cars.get(i)
+            if st is None:
+                continue
+
+            compound = int(s.m_actualTyreCompound)
+            age = int(s.m_tyresAgeLaps)
+            if st.compound_actual and compound and compound != st.compound_actual:
+                st.stint_index += 1
+            elif st.tyre_age and age < st.tyre_age:
+                # возраст шины уменьшился — новый комплект (пит-стоп)
+                st.stint_index += 1
+            st.compound_actual = compound
+            st.compound_visual = int(s.m_visualTyreCompound)
+            st.tyre_age = age
+            if st.fuel_at_start is None:
+                st.fuel_at_start = float(s.m_fuelInTank)
+            st.ers_deployed_max = max(st.ers_deployed_max, float(s.m_ersDeployedThisLap))
+
+            if do_sample:
+                self._pending_status.append((
+                    uid, i, st.lap_num, st.status_idx,
+                    float(s.m_fuelInTank), float(s.m_fuelRemainingLaps),
+                    float(s.m_ersStoreEnergy), float(s.m_ersDeployedThisLap),
+                    float(s.m_ersHarvestedThisLapMGUK) + float(s.m_ersHarvestedThisLapMGUH),
+                    float(s.m_enginePowerICE), float(s.m_enginePowerMGUK),
+                ))
+                st.status_idx += 1
 
     def _on_motion(self, pkt: PacketMotion) -> None:
-        i = self.player_car_index
-        if i >= MAX_CARS:
-            return
-        m = pkt.m_carMotionData[i]
-        self._motion = {
-            "x": float(m.m_worldPositionX),
-            "y": float(m.m_worldPositionY),
-            "z": float(m.m_worldPositionZ),
-            "vx": float(m.m_worldVelocityX),
-            "vy": float(m.m_worldVelocityY),
-            "vz": float(m.m_worldVelocityZ),
-            "g_lat": float(m.m_gForceLateral),
-            "g_lon": float(m.m_gForceLongitudinal),
-            "g_vert": float(m.m_gForceVertical),
-            "yaw": float(m.m_yaw),
-            "pitch": float(m.m_pitch),
-            "roll": float(m.m_roll),
-        }
+        for i in self.tracked_cars():
+            m = pkt.m_carMotionData[i]
+            self._car_motion[i] = {
+                "x": float(m.m_worldPositionX),
+                "y": float(m.m_worldPositionY),
+                "z": float(m.m_worldPositionZ),
+                "vx": float(m.m_worldVelocityX),
+                "vy": float(m.m_worldVelocityY),
+                "vz": float(m.m_worldVelocityZ),
+                "g_lat": float(m.m_gForceLateral),
+                "g_lon": float(m.m_gForceLongitudinal),
+                "g_vert": float(m.m_gForceVertical),
+                "yaw": float(m.m_yaw),
+                "pitch": float(m.m_pitch),
+                "roll": float(m.m_roll),
+            }
 
     def _on_motion_ex(self, pkt: PacketMotionEx) -> None:
         self._motion_ex = {
@@ -1134,9 +1210,8 @@ class SessionState:
         }
 
     def _on_damage(self, pkt: PacketCarDamage) -> None:
-        i = self.player_car_index
-        if i < MAX_CARS:
-            self._damage = pkt.m_carDamageData[i]
+        for i in self.tracked_cars():
+            self._car_damage[i] = pkt.m_carDamageData[i]
 
     def _on_final(self, pkt: PacketFinalClassification) -> None:
         uid = int(self.session_uid or 0)
@@ -1296,11 +1371,12 @@ class SessionState:
             self._flashback_seen = True
             t_back = float(d.get("session_time_s", parsed.header.session_time))
             self._flashback_until = max(self._flashback_until, parsed.header.session_time + 0.5)
-            st = self.cars.get(self.player_car_index)
-            if st is not None:
-                self._mark_flashback_lap(self.player_car_index, st, st.sample_idx)
-                self._reset_lap_buffers(st)
-                st.s1_ms = 0
-                st.s2_ms = 0
+            for idx in self.tracked_cars():
+                st_f = self.cars.get(idx)
+                if st_f is not None:
+                    self._mark_flashback_lap(idx, st_f, st_f.sample_idx)
+                    self._reset_lap_buffers(st_f)
+                    st_f.s1_ms = 0
+                    st_f.s2_ms = 0
             result.flashback = True
             log.info("flashback to t=%.2f s", t_back)

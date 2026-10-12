@@ -231,13 +231,20 @@ class Recorder:
         """True, пока жив цикл обработки."""
         return self._thread is not None and self._thread.is_alive()
 
-    def snapshot(self) -> LiveSnapshot:
-        """Мгновенный срез для GUI."""
-        return self.state.snapshot()
+    def snapshot(self, car_index: int | None = None) -> LiveSnapshot:
+        """Мгновенный срез для GUI.
 
-    def trace(self, max_points: int | None = None) -> list[Any]:
-        """Кольцевой буфер живого графика."""
-        return self.state.trace(max_points)
+        Args:
+            car_index: машина (``None`` — игрок; в splitscreen — второй
+                игрок по своему индексу).
+        """
+        return self.state.snapshot(car_index)
+
+    def trace(
+        self, car_index: int | None = None, max_points: int | None = None
+    ) -> list[Any]:
+        """Кольцевой буфер живого графика (у каждого игрока свой)."""
+        return self.state.trace(car_index, max_points)
 
     def health(self) -> dict[str, Any]:
         """Сводка для статусной строки."""
@@ -250,6 +257,12 @@ class Recorder:
             })
         out["state"] = self.state.packets_total
         out["state_errors"] = self.state.parse_errors
+        started = self.stats.started_at
+        if started:
+            elapsed = max(1e-6, time.time() - started)
+            out["packets_per_sec"] = self.stats.datagrams / elapsed
+            if self.stats.last_packet_at is not None:
+                out["last_packet_age_s"] = time.time() - self.stats.last_packet_at
         if self.listener is not None:
             ls: ListenerStats = self.listener.stats
             out["listener"] = {

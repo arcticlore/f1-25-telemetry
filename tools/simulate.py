@@ -70,7 +70,6 @@ AGENTS.md 3.2 would need 50 bytes per car, i.e. 4 fields that do not exist;
 the same PDF gives 1133 = 29 + 24 x 46 for the 2026 Season Pack.
 """
 
-
 # --- Packet serialization ----------------------------------------------------
 
 def pack_header(
@@ -224,9 +223,16 @@ def pack_event(hdr: bytes, code: str, details: bytes = b"") -> bytes:
     return data
 
 
-def pack_participants(hdr: bytes, cars: list[CarSim]) -> bytes:
-    """Packet 4 - Participants (1284 bytes)."""
-    out = [hdr, struct.pack("<B", len(cars))]
+def pack_participants(hdr: bytes, cars: list[CarSim],
+                      num_active: int | None = None) -> bytes:
+    """Packet 4 - Participants (1284 bytes).
+
+    Args:
+        cars: массив из ровно 22 машин (как в игре).
+        num_active: значение ``m_numActiveCars`` (по умолчанию — ``len(cars)``).
+    """
+    active = len(cars) if num_active is None else int(num_active)
+    out = [hdr, struct.pack("<B", active)]
     for c in cars:
         out.append(struct.pack(
             "<BBBBBBB32sBBHBB" + "12B",
@@ -617,6 +623,7 @@ class CarSim:
     driver_id: int
     pace: float
     track_length: float
+    active: bool = True   # False = не входит в m_numActiveCars (stands in garage)
 
     lap_num: int = 1
     lap_start_t: float = 0.0
@@ -702,13 +709,20 @@ class CarSim:
 
 @dataclass
 class SimConfig:
-    """Simulation parameters."""
+    """Simulation parameters.
+
+    Attributes:
+        cars: число активных машин (``m_numActiveCars``). Пакеты всегда
+            собираются на 22 машины, как в игре; неактивные стоят в боксе.
+        secondary_car: индекс второго игрока для splitscreen (255 = нет второго).
+    """
 
     host: str = "127.0.0.1"
     port: int = 20777
     hz: float = 60.0
     laps: int = 3
-    cars: int = 20
+    cars: int = 22
+    secondary_car: int = 255
     session_type: int = 15
     track_id: int = 7
     track_length: float = 5000.0
@@ -741,10 +755,12 @@ class Simulator:
         self.fixture_fh = None
         self.cars: list[CarSim] = []
         self._make_cars()
+        self.active_cars = max(1, min(cfg.cars, MAX_CARS))
 
     def _make_cars(self) -> None:
-        n = max(1, min(self.cfg.cars, MAX_CARS))
-        for i in range(n):
+        """Создаёт всегда MAX_CARS машин; активные — первые ``cfg.cars``."""
+        active = max(1, min(self.cfg.cars, MAX_CARS))
+        for i in range(MAX_CARS):
             pace = 1.0 - self.rng.uniform(0.0, 0.03) - i * 0.001
             car = CarSim(
                 idx=i,
@@ -758,7 +774,11 @@ class Simulator:
                 driver_id=i,
                 pace=pace,
                 track_length=self.cfg.track_length,
+                active=i < active,
             )
+            if not car.active:
+                car.result_status = 1   # inactive
+                car.driver_status = 0   # in garage
             car.stints.append((TYRE_C3, VISUAL_SOFT, 0))
             self.cars.append(car)
 
@@ -793,6 +813,22 @@ class Simulator:
         n_prof = len(self.profile.speed_kmh)
 
         for car in self.cars:
+            if not car.active:
+                # неактивная машина стоит в боксе: без физики и кругов
+                car.speed_kmh = 0.0
+                car.throttle = 0.0
+                car.brake = 0.0
+                car.gear = 0
+                car.rpm = 800
+                car.rev_fraction = 0.0
+                car.steer = 0.0
+                car.drs = 0
+                car.drs_allowed = 0
+                car.g_lat = car.g_lon = car.g_vert = 0.0
+                car.result_status = 1
+                car.driver_status = 0
+                car.total_distance = 0.0
+                continue
             car.pit_status = 0
             car.in_pit_window = False
             car.pit_limiter = 0
@@ -864,7 +900,8 @@ class Simulator:
             out.append(self._session_packet())
             out.append(pack_setup(self._hdr(5), self.cars))
         if self.frame == 1 or self.frame % max(1, int(round(hz / 5))) == 0:
-            out.append(pack_participants(self._hdr(4), self.cars))
+            out.append(pack_participants(
+                self._hdr(4), self.cars, num_active=self.active_cars))
             out.append(pack_lobby(self._hdr(9), self.cars))
         if self.frame == 1 or self.frame % max(1, int(round(hz / 10))) == 0:
             out.append(pack_damage(self._hdr(10), self.cars))
@@ -889,7 +926,8 @@ class Simulator:
 
     def _hdr(self, packet_id: int) -> bytes:
         return pack_header(
-            packet_id, self.cfg.session_uid, self.t, self.frame, self.frame * 3
+            packet_id, self.cfg.session_uid, self.t, self.frame, self.frame * 3,
+            secondary=self.cfg.secondary_car,
         )
 
     def _session_packet(self) -> bytes:
@@ -1099,7 +1137,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=20777)
     p.add_argument("--hz", type=float, default=60.0, help="packet rate (20/30/60)")
     p.add_argument("--laps", type=int, default=3)
-    p.add_argument("--cars", type=int, default=20)
+    p.add_argument("--cars", type=int, default=22,
+                   help="активных машин (m_numActiveCars); пакеты всегда на 22")
+    p.add_argument("--secondary-car", type=int, default=255,
+                   help="индекс второго игрока (splitscreen, 255 = нет второго)")
     p.add_argument("--session-type", type=int, default=15)
     p.add_argument("--track-id", type=int, default=7)
     p.add_argument("--track-length", type=float, default=5000.0, help="metres")
@@ -1128,6 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
         hz=args.hz,
         laps=args.laps,
         cars=args.cars,
+        secondary_car=args.secondary_car,
         session_type=args.session_type,
         track_id=args.track_id,
         track_length=args.track_length,
