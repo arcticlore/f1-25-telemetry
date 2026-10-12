@@ -18,7 +18,7 @@
 ## Установка
 
 ```bash
-# Python 3.11+ (разработка на 3.13)
+# Python 3.11+ (закреплён 3.14 в .python-version)
 uv sync                # создаёт .venv с PySide6, pyqtgraph, pytest
 # или без uv:
 python3 -m venv .venv && . .venv/bin/activate
@@ -106,6 +106,9 @@ uv run run.py --fixture tests/fixtures/session_short.bin   # реплей без
 # запись N секунд без GUI
 uv run python -m f1telemetry.cli record --db data/f1.sqlite --seconds 300
 
+# только пакеты от конкретного IP (если в LAN шлют чужой UDP на 20777)
+uv run python -m f1telemetry.cli record --source-filter 192.168.0.10
+
 # воспроизвести записанные пакеты в БД
 uv run python -m f1telemetry.cli replay --fixture tests/fixtures/session_short.bin --db data/f1.sqlite
 
@@ -130,6 +133,8 @@ QT_QPA_PLATFORM=offscreen uv run python run.py --selftest
 ```bash
 uv run python tools/simulate.py --laps 3 --hz 60 --port 20777
 uv run python tools/simulate.py --laps 2 --record-fixture tests/fixtures/session_short.bin
+# --pace-ms 0.2 (дефолт): мелкая пауза между датаграммами, чтобы UDP-бёрсты
+# тика не терялись в буфере сокета
 ```
 
 ---

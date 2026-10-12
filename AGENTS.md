@@ -19,7 +19,7 @@
 
 ## 2. Стек и жёсткие требования
 
-- Python **3.11+** (разработка/тесты — на 3.13).
+- Python **3.11+** (закреплена **3.14** в `.python-version`; тесты зелёные).
 - **PySide6** (Qt 6) — GUI. **pyqtgraph** — графики реального времени.
 - Ядро парсинга — только stdlib: `socket`, `struct`/`ctypes`, `threading`, `sqlite3`, `json`, `pathlib`.
 - Хранилище — **SQLite** (stdlib `sqlite3`), режим **WAL**, батчёвые коммиты.
@@ -559,3 +559,27 @@ python tools/simulate.py --laps 3 --record-fixture tests/fixtures/session_3laps.
     перезапускает запись. Тесты изолируют XDG autouse-фикстурой в
     `tests/conftest.py`. `cli anonymize` / `Storage.anonymize` — передача БД
     третьим лицам (никнеймы → «Driver N`).
+
+13. **`--source-filter <IP>`** (`cli record`): датаграммы от чужих адресов
+    отбрасываются без разбора, счётчик `stats.source_filtered`. Нужен из-за
+    чужих UDP-пакетов формата 2024/2023 на порту 20777. `Listener` кладёт
+    в очередь кортеж `(bytes, src_ip)`; `handle_datagram(data, src_addr=…)`
+    принимает IP, `on_format_warning(fmt, src)` — ворнинг с адресом
+    (CLI печатает IP, GUI — баннер «Пакеты формата N от IP»).
+    Фикстура/`feed()` без IP фильтр не задействуют.
+
+14. **`Storage.backfill_lap_tyres`**: игра может слать `actualTyreCompound=0`
+    в первые круги — `laps` пишутся с compound=0, первый «настоящий»
+    Car Status приходит позже. State ставит op-запись при смене compound
+    (`state._on_status` → `UPDATE laps … WHERE compound_actual=0 AND
+    lap_num<=?`); чужие стинты не затрагиваются.
+
+15. **Черновик-гейт в `state.on_packet`**: пока не пришли `Participants` с
+    `m_numActiveCars>0`, обрабатываются только пакеты 1 (Session) и 4;
+    `_queue_session_row` — no-op без участников. Меню/лобби больше не
+    плодит сирот-сессий с `num_cars=NULL` в браузере.
+
+16. **Симулятор: `--pace-ms` (дефолт 0.2)** — межпакетная пауза внутри тика
+    (гасит UDP-бёрсты на 60 Гц). `overall_frame_identifier` в `_hdr` —
+    `frame`, не `frame*3` (тройной gap рисовал ложные `lost_frames`).
+    Логи: `RotatingFileHandler` 5 МБ × 3 (`paths.setup_logging`).
