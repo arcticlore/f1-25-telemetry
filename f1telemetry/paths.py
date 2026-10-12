@@ -18,6 +18,7 @@ import logging
 import os
 import socket
 from dataclasses import asdict, dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .constants import DEFAULT_LISTEN_HOST, DEFAULT_UDP_PORT
@@ -165,8 +166,18 @@ def save_config(cfg: AppConfig, path: Path | None = None) -> Path:
 _file_handler: logging.FileHandler | None = None
 
 
+LOG_MAX_BYTES = 5 * 1024 * 1024
+"""Максимальный размер app.log перед ротацией, байт (5 МБ)."""
+
+LOG_BACKUP_COUNT = 3
+"""Сколько ротированных копий app.log.N хранить."""
+
+
 def setup_logging(verbose: bool = False) -> None:
-    """Консоль + файл в ``log_dir()/app.log`` (один FileHandler на процесс).
+    """Консоль + ротируемый файл в ``log_dir()/app.log`` (один handler на процесс).
+
+    Файл: ``RotatingFileHandler`` 5 МБ × 3 копии (app.log, app.log.1 …),
+    чтобы сессия с ошибками не раздувала лог до десятков мегабайт.
 
     Уровень: ``$F1TELEMETRY_LOG`` или DEBUG при ``verbose``, иначе INFO.
     """
@@ -190,7 +201,12 @@ def setup_logging(verbose: bool = False) -> None:
         try:
             d = log_dir()
             d.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(d / "app.log", encoding="utf-8")
+            fh = RotatingFileHandler(
+                d / "app.log",
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
             fh.setFormatter(fmt)
             root.addHandler(fh)
             _file_handler = fh

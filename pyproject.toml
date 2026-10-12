@@ -33,7 +33,6 @@ packages = ["f1telemetry"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
