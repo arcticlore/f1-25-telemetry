@@ -9,5 +9,6 @@ __all__ = [
     "live_dash",
     "live_trace",
     "session_browser",
+    "settings_view",
     "status_bar",
 ]

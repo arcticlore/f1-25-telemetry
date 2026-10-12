@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..paths import AppConfig, load_config, save_config
 from ..recorder import Recorder
 from ..ui.theme import COLORS
 from ..ui.widgets.analytics_view import AnalyticsView
@@ -29,6 +30,7 @@ from ..ui.widgets.lap_table import LapTable
 from ..ui.widgets.live_dash import LiveDash
 from ..ui.widgets.live_trace import LiveTrace
 from ..ui.widgets.session_browser import SessionBrowser
+from ..ui.widgets.settings_view import SettingsView
 from ..ui.widgets.status_bar import StatusBarWidget
 
 __all__ = ["RecorderBridge", "MainWindow"]
@@ -54,16 +56,20 @@ class MainWindow(QMainWindow):
         self,
         db_path: str | Path,
         *,
-        host: str = "0.0.0.0",
-        port: int = 20777,
+        host: str | None = None,
+        port: int | None = None,
         fixture: str | Path | None = None,
         replay_speed: float = 0.0,
         autostart: bool = True,
+        config: AppConfig | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("F1 25 Telemetry Recorder")
         self.resize(1280, 800)
+        self._config = config if config is not None else load_config()
         self.db_path = Path(db_path)
+        self._host = host or self._config.host
+        self._port = port or self._config.port
         self._fixture = Path(fixture) if fixture else None
 
         # --- статус/баннер ---
@@ -113,10 +119,16 @@ class MainWindow(QMainWindow):
         # Analytics
         self.analytics = AnalyticsView()
 
+        # Settings
+        self.settings_tab = SettingsView()
+        self.settings_tab.set_config(self._config)
+        self.settings_tab.settings_changed.connect(self._on_settings_changed)
+
         self.tabs.addTab(self.live, "Live")
         self.tabs.addTab(self.browser, "Сессии")
         self.tabs.addTab(self.compare, "Сравнение")
         self.tabs.addTab(self.analytics, "Аналитика")
+        self.tabs.addTab(self.settings_tab, "Настройки")
         self.setCentralWidget(central)
 
         self.status = StatusBarWidget()
@@ -138,7 +150,7 @@ class MainWindow(QMainWindow):
         self._combo_key: tuple[int, int] | None = None
         self._lap_buffers: dict[int, list[dict[str, Any]]] = {}
         if autostart:
-            self._start_recorder(host, port)
+            self._start_recorder(self._host, self._port)
 
         # --- опрос GUI ~30 Гц ---
         self._timer = QTimer(self)
@@ -173,6 +185,40 @@ class MainWindow(QMainWindow):
             self.recorder.stop()
             self.recorder = None
 
+    def _on_settings_changed(self) -> None:
+        """Сохраняет конфиг и перезапускает запись при смене адреса/порта/БД."""
+        cfg = self.settings_tab.collect()
+        self._config = cfg
+        try:
+            save_config(cfg)
+        except OSError:
+            log.warning("не удалось сохранить конфиг", exc_info=True)
+
+        new_db = cfg.resolved_db()
+        db_changed = new_db != self.db_path
+        if db_changed:
+            self.db_path = new_db
+            try:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log.warning("не удалось создать каталог %s", self.db_path.parent)
+            self.browser.set_db_path(self.db_path)
+            self.compare.configure(self.db_path, None)
+            self.analytics.configure(self.db_path, None)
+
+        was_running = self.recorder is not None
+        net_changed = cfg.host != self._host or cfg.port != self._port
+        self._host, self._port = cfg.host, cfg.port
+        if was_running and (net_changed or db_changed):
+            self._stop_recorder()
+            try:
+                self._start_recorder(self._host, self._port)
+            except OSError as e:
+                QMessageBox.warning(
+                    self, "UDP",
+                    f"Не удалось перезапустить запись на {self._host}:{self._port}:\n{e}")
+            self._timer.start()
+
     # --- меню --------------------------------------------------------------
 
     def _build_menu(self) -> None:
@@ -199,10 +245,16 @@ class MainWindow(QMainWindow):
             return
         self._stop_recorder()
         self.db_path = Path(path)
+        self._config.db_path = str(self.db_path)
+        try:
+            save_config(self._config)
+        except OSError:
+            log.warning("не удалось сохранить конфиг", exc_info=True)
+        self.settings_tab.set_config(self._config)
         self.browser.set_db_path(self.db_path)
         self.compare.configure(self.db_path, None)
         self.analytics.configure(self.db_path, None)
-        self._start_recorder("0.0.0.0", 20777)
+        self._start_recorder(self._host, self._port)
         self._timer.start()
 
     def _about(self) -> None:

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -27,9 +28,10 @@ _COLS = ("Сессия", "Трасса", "Тип", "Погода", "Старт (
 
 
 class SessionBrowser(QWidget):
-    """Список сессий в БД + кнопка «Открыть»."""
+    """Список сессий в БД + кнопки «Открыть»/«Удалить»."""
 
     session_opened = Signal(int)   # session_uid
+    session_deleted = Signal(int)  # session_uid
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -46,11 +48,14 @@ class SessionBrowser(QWidget):
         self.btn_open = QPushButton("Открыть")
         self.btn_open.setProperty("accent", "true")
         self.btn_open.setEnabled(False)
+        self.btn_delete = QPushButton("Удалить")
+        self.btn_delete.setEnabled(False)
         self.btn_refresh = QPushButton("Обновить")
         head.addWidget(self.title)
         head.addWidget(self.hint)
         head.addStretch(1)
         head.addWidget(self.btn_refresh)
+        head.addWidget(self.btn_delete)
         head.addWidget(self.btn_open)
         lay.addLayout(head)
 
@@ -70,6 +75,7 @@ class SessionBrowser(QWidget):
         self._uids: list[int] = []
         self.table.itemSelectionChanged.connect(self._on_selection)
         self.btn_open.clicked.connect(self._on_open)
+        self.btn_delete.clicked.connect(self._on_delete)
         self.btn_refresh.clicked.connect(self.refresh)
 
     # --- API ---------------------------------------------------------------
@@ -131,9 +137,36 @@ class SessionBrowser(QWidget):
         return None
 
     def _on_selection(self) -> None:
-        self.btn_open.setEnabled(self._selected_uid() is not None)
+        has = self._selected_uid() is not None
+        self.btn_open.setEnabled(has)
+        self.btn_delete.setEnabled(has)
 
     def _on_open(self) -> None:
         uid = self._selected_uid()
         if uid is not None:
             self.session_opened.emit(uid)
+
+    def _on_delete(self) -> None:
+        uid = self._selected_uid()
+        db_path = getattr(self, "_db_path", None)
+        if uid is None or db_path is None:
+            return
+        answer = QMessageBox.question(
+            self, "Удалить сессию",
+            f"Удалить сессию {uid} и все её данные (круги, телеметрия, "
+            "события) из базы?\nДействие необратимо.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            st = Storage(db_path)
+            try:
+                st.delete_session(uid)
+            finally:
+                st.close()
+        except OSError:
+            return
+        self.refresh()
+        self.session_deleted.emit(uid)

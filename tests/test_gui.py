@@ -42,10 +42,11 @@ def test_widgets_construct(qapp):
     from f1telemetry.ui.widgets.live_dash import LiveDash
     from f1telemetry.ui.widgets.live_trace import LiveTrace
     from f1telemetry.ui.widgets.session_browser import SessionBrowser
+    from f1telemetry.ui.widgets.settings_view import SettingsView
     from f1telemetry.ui.widgets.status_bar import StatusBarWidget
 
     for cls in (LiveDash, LiveTrace, LapTable, SessionBrowser,
-                LapCompare, AnalyticsView, StatusBarWidget):
+                LapCompare, AnalyticsView, StatusBarWidget, SettingsView):
         w = cls()
         w.show()
         qapp.processEvents()
@@ -208,3 +209,61 @@ def test_player_combo_splitscreen(qapp, tmp_path):
 
     win.close()
     qapp.processEvents()
+
+
+def test_settings_tab_saves_config(qapp, tmp_path, monkeypatch):
+    """Правка порта на вкладке «Настройки» сохраняет config.json (XDG-изолированный)."""
+    from f1telemetry.paths import AppConfig, config_file, load_config
+    from f1telemetry.ui.main_window import MainWindow
+
+    cfg = AppConfig(host="0.0.0.0", port=20777, db_path=str(tmp_path / "s.sqlite"),
+                    autostart=False)
+    mw = MainWindow(cfg.resolved_db(), config=cfg, autostart=False)
+    assert mw.settings_tab.collect().port == 20777
+
+    mw.settings_tab.port_spin.setValue(21777)
+    mw.settings_tab.host_edit.setText("127.0.0.1")
+    mw.settings_tab.host_edit.editingFinished.emit()
+    qapp.processEvents()
+
+    saved = load_config(config_file())
+    assert saved.port == 21777
+    assert saved.host == "127.0.0.1"
+    assert mw._port == 21777 and mw._host == "127.0.0.1"
+    mw.close()
+
+
+def test_session_browser_delete(qapp, tmp_path, monkeypatch):
+    """Кнопка «Удалить» удаляет сессию из БД после подтверждения."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from f1telemetry.recorder import Recorder
+    from f1telemetry.storage import Storage
+    from f1telemetry.ui.widgets.session_browser import SessionBrowser
+    import simulate as sim
+
+    db = tmp_path / "del.sqlite"
+    s = sim.Simulator(sim.SimConfig(hz=10.0, laps=1, cars=2, track_length=200.0,
+                                    seed=5, session_uid=555001, verbose=False))
+    rec = Recorder(db)
+    data = []
+    while s.t < s.profile.lap_time_s * 1.0:
+        data.extend(s.tick())
+    rec.feed(data)
+    rec.stop()
+
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+    browser = SessionBrowser()
+    browser.set_db_path(db)
+    assert browser.table.rowCount() == 1
+    browser.table.selectRow(0)
+    browser._on_delete()
+    qapp.processEvents()
+
+    st = Storage(db)
+    assert st.list_sessions() == []
+    st.close()
+    assert browser.table.rowCount() == 0
