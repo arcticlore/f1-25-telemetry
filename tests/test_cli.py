@@ -134,3 +134,32 @@ def test_replay_missing_fixture(tmp_path, capsys):
     rc = cli.main(["replay", "--fixture", str(tmp_path / "no.bin")])
     assert rc == 2
     assert "fixture not found" in capsys.readouterr().err
+
+
+def test_anonymize_cli(capsys, tmp_path):
+    db, uid = _make_db(tmp_path)
+    import re
+
+    from f1telemetry.storage import Storage
+
+    st = Storage(db)
+    st.upsert_participant(uid, 0, name="Real Nickname")
+    st.commit()
+    st.close()
+
+    rc = cli.main(["anonymize", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "anonymized 1 session(s)" in out
+
+    st = Storage(db)
+    names = [p["name"] for p in st.list_participants(uid)]
+    assert "Real Nickname" not in names
+    assert all(re.fullmatch(r"Driver \d+", n) for n in names)
+    st.close()
+
+
+def test_anonymize_missing_db(tmp_path, capsys):
+    rc = cli.main(["anonymize", "--db", str(tmp_path / "nope.sqlite")])
+    assert rc == 2
+    assert "db not found" in capsys.readouterr().err

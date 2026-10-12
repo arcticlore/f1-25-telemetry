@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -422,4 +423,34 @@ def test_session_uid_u64_overflow(tmp_path):
     st.upsert_session(UID)
     st.commit()
     assert {s.session_uid for s in st.list_sessions()} == {big, UID}
+    st.close()
+
+
+def test_anonymize(tmp_path):
+    """Имена → «Driver N», name из payload событий удаляется."""
+    st = Storage(tmp_path / "anon.sqlite")
+    uid = 777001
+    st.upsert_session(uid, track_id=5, track_name="Monaco")
+    st.upsert_participant(uid, 0, name="Секретный Ник", team_id=0,
+                          team_name="Mercedes", race_number=44)
+    st.upsert_participant(uid, 3, name="Rival Name", team_id=1,
+                          team_name="Ferrari", race_number=16)
+    st.insert_event(uid, 1.0, "FTLP", 3, None,
+                    {"vehicleIdx": 3, "lap_time": 90.5, "name": "Rival Name"})
+    st.insert_event(uid, 2.0, "SSTA", None, None, None)
+    st.commit()
+
+    assert st.anonymize(uid) == 1
+
+    parts = {p["car_index"]: p["name"] for p in st.list_participants(uid)}
+    assert parts == {0: "Driver 1", 3: "Driver 4"}
+
+    ev = st.events(uid)
+    ftlp = json.loads(ev[0]["payload_json"])
+    assert "name" not in ftlp
+    assert ftlp["lap_time"] == 90.5
+    assert ev[1]["payload_json"] == "{}"  # SSTA не тронут
+
+    # повторный вызов идемпотентен
+    assert st.anonymize(uid) == 1
     st.close()

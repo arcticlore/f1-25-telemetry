@@ -622,6 +622,49 @@ class Storage:
             self.conn.execute(f"DELETE FROM {t} WHERE {key}=?", (session_uid,))
         return len(tables)
 
+    def anonymize(self, session_uid: int | None = None) -> int:
+        """Анонимизация: имена участников → «Driver N», name из событий удаляется.
+
+        N = car_index + 1 (стабильно в пределах сессии). Никнеймы из
+        мультиплеера лежат в ``participants.name`` и в ``events.payload_json``
+        (ключ ``name``) — прогоняйте перед передачей файла третьим лицам.
+
+        Args:
+            session_uid: только одна сессия; None — все сессии в БД.
+
+        Returns:
+            Число обработанных сессий.
+        """
+        if session_uid is None:
+            uids = [int(r[0]) for r in self.conn.execute(
+                "SELECT session_uid FROM sessions")]
+        else:
+            uids = [int(session_uid)]
+        for uid in uids:
+            self.conn.execute(
+                "UPDATE participants SET name='Driver ' || (car_index + 1)"
+                " WHERE session_uid=?",
+                (uid,),
+            )
+            rows = self.conn.execute(
+                "SELECT id, payload_json FROM events WHERE session_uid=?"
+                " AND payload_json LIKE '%\"name\"%'",
+                (uid,),
+            ).fetchall()
+            for r in rows:
+                try:
+                    payload = json.loads(r["payload_json"] or "{}")
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict) and "name" in payload:
+                    payload.pop("name", None)
+                    self.conn.execute(
+                        "UPDATE events SET payload_json=? WHERE id=?",
+                        (json.dumps(payload, ensure_ascii=False), r["id"]),
+                    )
+        self.conn.commit()
+        return len(uids)
+
     def commit(self) -> None:
         """Коммит накопленных изменений."""
         self.conn.commit()
