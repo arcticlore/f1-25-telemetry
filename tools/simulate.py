@@ -162,8 +162,14 @@ def pack_session(
     duration: int,
     sc_status: int,
     session_link: int,
+    pit_ideal: int = 0,
+    pit_latest: int = 0,
+    forecast: list[tuple[int, int, int]] | None = None,
 ) -> bytes:
-    """Packet 1 - Session (753 bytes)."""
+    """Packet 1 - Session (753 bytes).
+
+    ``forecast``: список ``(time_offset_мин, weather, rain_pct)``.
+    """
     out = [hdr]
     out.append(struct.pack(
         "<BbbBHBbBHH",
@@ -172,11 +178,15 @@ def pack_session(
     ))
     out.append(struct.pack("<BBBBBB", int(PIT_SPEED_KMH), 0, 0, 255, 1, 4))
     out.extend(struct.pack("<fb", 0.25, 0) for _ in range(21))
-    out.append(struct.pack("<BBB", sc_status, 0, 0))
-    out.extend(b"\x00" * 8 for _ in range(64))
+    fcs = list(forecast or [])[:64]
+    out.append(struct.pack("<BBB", sc_status, 0, len(fcs)))
+    for off, w, rain in fcs:
+        out.append(struct.pack("<BBBbbbbB", 0, off, w, track_temp, 0, air_temp, 0, rain))
+    out.extend(b"\x00" * 8 for _ in range(64 - len(fcs)))
     out.append(struct.pack("<BB", 1, 3))
     out.append(struct.pack("<III", 1, 1, session_link))
-    out.append(bytes(14))
+    out.append(struct.pack("<BBB", pit_ideal, pit_latest, 0))  # ideal/latest/rejoin
+    out.append(bytes(11))  # assists + gameMode + ruleSet
     out.append(struct.pack("<I", 36000))
     out.append(bytes(33))
     out.append(bytes(12))
@@ -936,12 +946,17 @@ class Simulator:
     def _session_packet(self) -> bytes:
         cfg = self.cfg
         duration = int(self.profile.lap_time_s * cfg.laps * 1.5) + 60
+        total_laps = cfg.laps if cfg.session_type in (15, 16, 17) else 0
+        # пит-окно и прогноз — как их шлёт игра (для вкладки Engineer)
+        pit_ideal = max(2, int(total_laps * 0.45)) if total_laps else 0
+        pit_latest = pit_ideal + 5 if pit_ideal else 0
+        forecast = [(10, 2, 0), (30, 2, 25), (60, 3, 55)]
         return pack_session(
             self._hdr(1),
             weather=2,
             track_temp=38,
             air_temp=24,
-            total_laps=cfg.laps if cfg.session_type in (15, 16, 17) else 0,
+            total_laps=total_laps,
             track_length=int(cfg.track_length),
             session_type=cfg.session_type,
             track_id=cfg.track_id,
@@ -949,6 +964,9 @@ class Simulator:
             duration=duration,
             sc_status=self.sc_status,
             session_link=self.session_link,
+            pit_ideal=pit_ideal,
+            pit_latest=pit_latest,
+            forecast=forecast,
         )
 
     def _timed_events(self) -> list[bytes]:

@@ -25,6 +25,7 @@ from ..paths import AppConfig, load_config, save_config
 from ..recorder import Recorder
 from ..ui.theme import COLORS
 from ..ui.widgets.analytics_view import AnalyticsView
+from ..ui.widgets.engineer import EngineerTab
 from ..ui.widgets.lap_compare import LapCompare
 from ..ui.widgets.lap_table import LapTable
 from ..ui.widgets.live_dash import LiveDash
@@ -109,6 +110,9 @@ class MainWindow(QMainWindow):
         live_lay.addWidget(self.trace, 3)
         live_lay.addWidget(self.lap_table, 2)
 
+        # Engineer — крупные панели «от стенда» (ввод в игру не эмулируется)
+        self.engineer = EngineerTab(self.db_path)
+
         # Sessions
         self.browser = SessionBrowser()
         self.browser.set_db_path(self.db_path)
@@ -125,6 +129,7 @@ class MainWindow(QMainWindow):
         self.settings_tab.settings_changed.connect(self._on_settings_changed)
 
         self.tabs.addTab(self.live, "Live")
+        self.tabs.addTab(self.engineer, "Engineer")
         self.tabs.addTab(self.browser, "Сессии")
         self.tabs.addTab(self.compare, "Сравнение")
         self.tabs.addTab(self.analytics, "Аналитика")
@@ -206,6 +211,7 @@ class MainWindow(QMainWindow):
             self.browser.set_db_path(self.db_path)
             self.compare.configure(self.db_path, None)
             self.analytics.configure(self.db_path, None)
+            self.engineer.set_db_path(self.db_path)
 
         was_running = self.recorder is not None
         net_changed = cfg.host != self._host or cfg.port != self._port
@@ -255,6 +261,7 @@ class MainWindow(QMainWindow):
         self.browser.set_db_path(self.db_path)
         self.compare.configure(self.db_path, None)
         self.analytics.configure(self.db_path, None)
+        self.engineer.set_db_path(self.db_path)
         self._start_recorder(self._host, self._port)
         self._timer.start()
 
@@ -301,6 +308,7 @@ class MainWindow(QMainWindow):
         self._refresh_lap_table()
 
     def _on_event(self, code: str, data: dict[str, Any]) -> None:
+        self.engineer.on_event(code, data)
         if code in ("SSTA", "SEND", "CHQF", "RCWN", "SCAR", "RDFL"):
             log.info("event %s %s", code, data)
 
@@ -319,6 +327,7 @@ class MainWindow(QMainWindow):
     def _on_session_opened(self, uid: int) -> None:
         self.compare.configure(self.db_path, uid)
         self.analytics.configure(self.db_path, uid)
+        self.engineer.set_historical_session(uid)
         self.tabs.setCurrentWidget(self.compare)
 
     # --- опрос -------------------------------------------------------------
@@ -374,6 +383,7 @@ class MainWindow(QMainWindow):
         self.dash.update_snapshot(snap)
         self.trace.update_samples(rec.trace(view))
         self.status.update_health(rec.health())
+        self.engineer.update_snapshot(snap)
 
     # --- закрытие ----------------------------------------------------------
 

@@ -23,7 +23,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 WAL_TIMEOUT_S = 10.0
 
@@ -80,6 +80,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   identical_session INTEGER,
   started_at_utc TEXT, ended_at_utc TEXT,
   player_car_index INTEGER, num_cars INTEGER,
+  pit_ideal_lap INTEGER, pit_latest_lap INTEGER,
+  track_temp_c INTEGER, air_temp_c INTEGER,
+  forecast_json TEXT,
   notes TEXT
 );
 
@@ -279,6 +282,19 @@ class Storage:
             return
         cur.executescript(SCHEMA_SQL)
         cur.executescript(INDEX_SQL)
+        if current < 2:
+            # v2: пит-окно/погода/прогноз в sessions (для вкладки Engineer)
+            for col, typ in (
+                ("pit_ideal_lap", "INTEGER"),
+                ("pit_latest_lap", "INTEGER"),
+                ("track_temp_c", "INTEGER"),
+                ("air_temp_c", "INTEGER"),
+                ("forecast_json", "TEXT"),
+            ):
+                try:
+                    cur.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass  # колонка уже есть
         cur.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.conn.commit()
         log.info("storage schema migrated to v%s (%s)", SCHEMA_VERSION, self.path)
@@ -315,6 +331,11 @@ class Storage:
         ended_at_utc: str | None = None,
         player_car_index: int | None = None,
         num_cars: int | None = None,
+        pit_ideal_lap: int | None = None,
+        pit_latest_lap: int | None = None,
+        track_temp_c: int | None = None,
+        air_temp_c: int | None = None,
+        forecast_json: str | None = None,
         notes: str | None = None,
     ) -> None:
         """Вставляет или обновляет строку сессии (поля из последнего пакета Session)."""
@@ -325,8 +346,10 @@ class Storage:
               track_id, track_name, session_type, session_type_name,
               weather, total_laps, track_length_m,
               season_link_id, weekend_link_id, session_link_id, identical_session,
-              started_at_utc, ended_at_utc, player_car_index, num_cars, notes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              started_at_utc, ended_at_utc, player_car_index, num_cars,
+              pit_ideal_lap, pit_latest_lap, track_temp_c, air_temp_c,
+              forecast_json, notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(session_uid) DO UPDATE SET
               packet_format=excluded.packet_format,
               game_year=excluded.game_year,
@@ -346,6 +369,11 @@ class Storage:
               ended_at_utc=COALESCE(excluded.ended_at_utc, sessions.ended_at_utc),
               player_car_index=COALESCE(excluded.player_car_index, sessions.player_car_index),
               num_cars=COALESCE(excluded.num_cars, sessions.num_cars),
+              pit_ideal_lap=COALESCE(excluded.pit_ideal_lap, sessions.pit_ideal_lap),
+              pit_latest_lap=COALESCE(excluded.pit_latest_lap, sessions.pit_latest_lap),
+              track_temp_c=COALESCE(excluded.track_temp_c, sessions.track_temp_c),
+              air_temp_c=COALESCE(excluded.air_temp_c, sessions.air_temp_c),
+              forecast_json=COALESCE(excluded.forecast_json, sessions.forecast_json),
               notes=COALESCE(excluded.notes, sessions.notes)
             """,
             (
@@ -353,7 +381,9 @@ class Storage:
                 track_id, track_name, session_type, session_type_name,
                 weather, total_laps, track_length_m,
                 season_link_id, weekend_link_id, session_link_id, identical_session,
-                started_at_utc, ended_at_utc, player_car_index, num_cars, notes,
+                started_at_utc, ended_at_utc, player_car_index, num_cars,
+                pit_ideal_lap, pit_latest_lap, track_temp_c, air_temp_c,
+                forecast_json, notes,
             ),
         )
 
@@ -748,6 +778,76 @@ class Storage:
         return self.conn.execute(
             "SELECT * FROM sessions WHERE session_uid=?", (session_uid,)
         ).fetchone()
+
+    def engineer_summary(
+        self, session_uid: int, car_index: int | None = None
+    ) -> dict[str, Any]:
+        """Сводка записанной сессии для вкладки Engineer (только чтение).
+
+        Собирает строку сессии (пит-окно/погода — колонки v2, для сессий
+        до v2 остаются ``None``), последний круг/статус/детальную телеметрию
+        машины, позицию в классификации и сводку событий.
+
+        Args:
+            session_uid: сессия (u64 как знаковый int64).
+            car_index: машина; ``None`` → ``sessions.player_car_index``.
+
+        Returns:
+            Словарь с ключами ``session`` (dict) и ``car_index``; при
+            отсутствии сессии — пустой словарь.
+        """
+        row = self.get_session(session_uid)
+        if row is None:
+            return {}
+        sess = dict(row)
+        car = car_index if car_index is not None else int(sess.get("player_car_index") or 0)
+
+        def _one(sql: str) -> dict[str, Any] | None:
+            r = self.conn.execute(sql, (session_uid, car)).fetchone()
+            return dict(r) if r is not None else None
+
+        last_lap = _one(
+            "SELECT * FROM laps WHERE session_uid=? AND car_index=?"
+            " ORDER BY lap_num DESC LIMIT 1"
+        )
+        last_status = _one(
+            "SELECT * FROM car_status_samples WHERE session_uid=? AND car_index=?"
+            " ORDER BY lap_num DESC, sample_idx DESC LIMIT 1"
+        )
+        last_detail = _one(
+            "SELECT * FROM car_telemetry_detail WHERE session_uid=? AND car_index=?"
+            " ORDER BY lap_num DESC, sample_idx DESC LIMIT 1"
+        )
+        fc = _one(
+            "SELECT position, num_laps, result_status FROM final_classification"
+            " WHERE session_uid=? AND car_index=?"
+        )
+        events: dict[str, int] = {}
+        last_scar: str | None = None
+        for r in self.conn.execute(
+            "SELECT code, COUNT(*) AS n FROM events"
+            " WHERE session_uid=? AND (car_index=? OR car_index IS NULL)"
+            " GROUP BY code",
+            (session_uid, car),
+        ):
+            events[str(r["code"])] = int(r["n"])
+        r = self.conn.execute(
+            "SELECT payload_json FROM events"
+            " WHERE session_uid=? AND code='SCAR' ORDER BY session_time DESC LIMIT 1",
+            (session_uid,),
+        ).fetchone()
+        if r is not None and r["payload_json"]:
+            last_scar = str(r["payload_json"])
+        return {
+            "session": sess,
+            "car_index": car,
+            "last_lap": last_lap,
+            "last_status": last_status,
+            "last_detail": last_detail,
+            "classification": fc,
+            "events": events,
+            "last_scar_json": last_scar,
+        }
 
     def list_participants(self, session_uid: int) -> list[sqlite3.Row]:
         """Участники сессии, отсортированные по индексу машины."""

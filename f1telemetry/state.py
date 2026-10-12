@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -116,6 +117,11 @@ class LiveSnapshot:
     session_time_left_s: int = 0
     safety_car_status: int = 0
     num_cars: int = 0
+    # пит-окно (pitStopWindowIdealLap/LatestLap) и прогноз погоды
+    pit_ideal_lap: int = 0
+    pit_latest_lap: int = 0
+    # кортежи (offset_мин, weather, rain%, track_temp, air_temp)
+    forecast: tuple[tuple[int, int, int, int, int], ...] = ()
 
     # --- игрок ---
     car_index: int = 255
@@ -440,6 +446,9 @@ class SessionState:
         snap.session_time_left_s = int(meta.get("session_time_left_s") or 0)
         snap.safety_car_status = int(meta.get("safety_car_status") or 0)
         snap.num_cars = len(self.participants) or int(meta.get("num_cars") or 0)
+        snap.pit_ideal_lap = int(meta.get("pit_ideal_lap") or 0)
+        snap.pit_latest_lap = int(meta.get("pit_latest_lap") or 0)
+        snap.forecast = tuple(meta.get("forecast") or ())
 
         car = self.cars.get(idx)
         part = self.participants.get(idx, {})
@@ -752,6 +761,13 @@ class SessionState:
             identical_session=meta.get("identical_session"),
             player_car_index=self.player_car_index,
             num_cars=len(self.participants) or None,
+            pit_ideal_lap=meta.get("pit_ideal_lap"),
+            pit_latest_lap=meta.get("pit_latest_lap"),
+            track_temp_c=meta.get("track_temp_c"),
+            air_temp_c=meta.get("air_temp_c"),
+            forecast_json=json.dumps(
+                meta.get("forecast") or (), separators=(",", ":")
+            ),
         )
 
     def _reset_lap_buffers(self, st: _CarLap) -> None:
@@ -801,7 +817,23 @@ class SessionState:
             "identical_session": 0,
             "formula": int(pkt.m_formula),
             "pit_speed_limit": int(pkt.m_pitSpeedLimit),
+            "pit_ideal_lap": int(pkt.m_pitStopWindowIdealLap),
+            "pit_latest_lap": int(pkt.m_pitStopWindowLatestLap),
         })
+        n_forecast = min(
+            int(pkt.m_numWeatherForecastSamples), len(pkt.m_weatherForecastSamples)
+        )
+        samples: list[tuple[int, int, int, int, int]] = []
+        for fi in range(n_forecast):
+            fs = pkt.m_weatherForecastSamples[fi]
+            samples.append((
+                int(fs.m_timeOffset),
+                int(fs.m_weather),
+                int(fs.m_rainPercentage),
+                int(fs.m_trackTemperature),
+                int(fs.m_airTemperature),
+            ))
+        meta["forecast"] = tuple(samples)
         self.track_length_m = float(pkt.m_trackLength)
         self.session_link_identifier = int(pkt.m_sessionLinkIdentifier)
         self._queue_session_row()
