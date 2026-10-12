@@ -342,6 +342,7 @@ class SessionState:
         self.session_time: float = 0.0
         self._flashback_until: float = -1.0
         self._flashback_seen = False
+        self._uid_zero_warned = False
         self._stint_start_lap: dict[int, int] = {}
         self._stint_lap_times: dict[int, list[int]] = {}
 
@@ -596,6 +597,19 @@ class SessionState:
         self._rate_window.append(now)
 
         h = parsed.header
+
+        # Меню/переход между сессиями: игра шлёт sessionUID=0 («нет сессии»).
+        # Не переключаемся на него и не пишем — иначе в БД появляется
+        # «призрачная» сессия 0 с перезалитой историей кругов.
+        if h.session_uid == 0:
+            if self.session_uid is not None and not self._uid_zero_warned:
+                log.info(
+                    "ignoring packets with sessionUID=0 (menu); keeping session %s",
+                    self.session_uid,
+                )
+                self._uid_zero_warned = True
+            return PacketResult(packet_id=parsed.packet_id)
+
         if self._last_frame is not None and h.overall_frame_identifier > self._last_frame:
             gap = h.overall_frame_identifier - self._last_frame
             if gap > 1 and self._last_frame > 0:
@@ -686,6 +700,7 @@ class SessionState:
         self._next_status_t = 0.0
         self._flashback_until = -1.0
         self._flashback_seen = False
+        self._uid_zero_warned = False
         self._last_frame = None
         self.lost_frames = 0
         self.packets_total = 0
