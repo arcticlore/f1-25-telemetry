@@ -56,17 +56,20 @@ f1-telemetry/
 │       ├── app.py               # QApplication, тёмная тема, дефолты из конфига
 │       ├── main_window.py       # вкладки
 │       ├── theme.py
+│       ├── sounds.py            # звуковые алерты (WAV в кэш, QSoundEffect)
 │       └── widgets/
 │           ├── live_dash.py     # приборка
 │           ├── live_trace.py    # лента графиков (rolling window)
 │           ├── lap_table.py     # таблица кругов/секторов в реальном времени
 │           ├── session_browser.py  # браузер сессий + удаление
 │           ├── settings_view.py # вкладка «Настройки» (UDP, БД, автостарт, LAN)
+│           ├── engineer.py      # вкладка Engineer (крупные панели, алерты)
 │           ├── lap_compare.py   # оверлей двух кругов + дельта
 │           ├── analytics_view.py
 │           └── status_bar.py    # соединение, пакеты/с, потеря пакетов
 ├── tools/
-│   └── simulate.py              # генератор синтетических пакетов F1 25 (для тестов без игры)
+│   ├── simulate.py              # генератор синтетических пакетов F1 25 (для тестов без игры)
+│   └── grab_engineer.py         # offscreen-скриншот вкладки Engineer в README
 ├── tests/
 │   ├── test_packets.py          # размеры структур == таблице
 │   ├── test_parser.py           # round-trip: simulate -> parse
@@ -362,6 +365,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   identical_session INTEGER,          -- из sessionLinkIdentifier: это уже виденная сессия
   started_at_utc TEXT, ended_at_utc TEXT,
   player_car_index INTEGER, num_cars INTEGER,
+  pit_ideal_lap INTEGER, pit_latest_lap INTEGER,   -- v2: пит-окно (Engineer)
+  track_temp_c INTEGER, air_temp_c INTEGER,        -- v2
+  forecast_json TEXT,                              -- v2: прогноз [[offset,weather,rain,track,air]]
   notes TEXT
 );
 
@@ -583,3 +589,17 @@ python tools/simulate.py --laps 3 --record-fixture tests/fixtures/session_3laps.
     (гасит UDP-бёрсты на 60 Гц). `overall_frame_identifier` в `_hdr` —
     `frame`, не `frame*3` (тройной gap рисовал ложные `lost_frames`).
     Логи: `RotatingFileHandler` 5 МБ × 3 (`paths.setup_logging`).
+
+17. **Вкладка Engineer (`ui/widgets/engineer.py`)** — только вывод (никакой
+    эмуляции нажатий). Живой режим: `LiveSnapshot` (пит-окно/прогноз
+    добавлены в snapshot, meta `_on_session`); исторический:
+    `Storage.engineer_summary(uid)` — последний круг/статус/деталь из БД.
+    **Схема v2**: `SCHEMA_VERSION=2`, в `sessions` добавлены
+    `pit_ideal_lap/pit_latest_lap/track_temp_c/air_temp_c/forecast_json`
+    (миграция через `ALTER TABLE` для старых БД). Сессии, записанные до v2,
+    пит-окно не имеют (показ «—»). Звук: `ui/sounds.py` генерит WAV
+    (бипы stdlib `wave`) в `XDG_CACHE_HOME/f1-telemetry/alerts/`,
+    играет `QSoundEffect`; алерты — TMPT/дождь≥40%/износ≥80%/топливо≤1
+    круга/DRSE/DRSD/SCAR, cooldown 30 с, mute в шапке. Скриншот для README:
+    `python tools/grab_engineer.py` (offscreen). Сим `pack_session` теперь
+    шлёт пит-окно и прогноз (`pit_ideal/pit_latest/forecast`).
