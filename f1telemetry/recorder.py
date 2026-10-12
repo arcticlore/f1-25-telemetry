@@ -257,6 +257,7 @@ class Recorder:
             })
         out["state"] = self.state.packets_total
         out["state_errors"] = self.state.parse_errors
+        out["lost_frames"] = self.state.lost_frames
         started = self.stats.started_at
         if started:
             elapsed = max(1e-6, time.time() - started)
