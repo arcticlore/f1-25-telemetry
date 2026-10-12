@@ -50,16 +50,18 @@ f1-telemetry/
 │   ├── analytics.py             # производные метрики (дельты, стинты, деградация)
 │   ├── export.py                # экспорт в CSV/JSON/Parquet(опц.)
 │   ├── cli.py                   # headless-режим (запись без GUI)
+│   ├── paths.py                 # XDG-пути, AppConfig (config.json), setup_logging
 │   └── ui/
 │       ├── __init__.py
-│       ├── app.py               # QApplication, тёмная тема
+│       ├── app.py               # QApplication, тёмная тема, дефолты из конфига
 │       ├── main_window.py       # вкладки
 │       ├── theme.py
 │       └── widgets/
 │           ├── live_dash.py     # приборка
 │           ├── live_trace.py    # лента графиков (rolling window)
 │           ├── lap_table.py     # таблица кругов/секторов в реальном времени
-│           ├── session_browser.py
+│           ├── session_browser.py  # браузер сессий + удаление
+│           ├── settings_view.py # вкладка «Настройки» (UDP, БД, автостарт, LAN)
 │           ├── lap_compare.py   # оверлей двух кругов + дельта
 │           ├── analytics_view.py
 │           └── status_bar.py    # соединение, пакеты/с, потеря пакетов
@@ -472,6 +474,7 @@ python tools/simulate.py --laps 3 --hz 60 --port 20777   # синтетичес�
 python run.py                           # GUI
 python -m f1telemetry.cli record --db data/f1.sqlite --seconds 30   # запись без GUI
 python -m f1telemetry.cli export --db data/f1.sqlite --session <uid> --out export/ --format csv
+python -m f1telemetry.cli anonymize --db data/f1.sqlite   # анонимизация перед передачей БД
 ```
 
 `tools/simulate.py` — обязателен: без него ни тесты, ни GUI не проверить, если игра не запущена. Генерировать пакеты **независимым** кодом (`struct.pack` по полям согласно разделу 3, без импорта `f1telemetry.packets`) — это делает тест round-trip валидным. Симулятор должен уметь: число кругов, частоту, число машин, «идеальный круг» с реалистичным профилем скорость/газ/тормоз/передача, 2–3 стинта, пит-стоп, события (старт, быстрый круг, финиш), и режим `--record-fixture tests/fixtures/*.bin` для записи бинарных пакетов в файл.
@@ -537,3 +540,22 @@ python tools/simulate.py --laps 3 --record-fixture tests/fixtures/session_3laps.
    машины, 2 круга по короткой трассе (400 м), 10 Гц. Генерируется командой:
    `python tools/simulate.py --laps 2 --hz 10 --cars 22 --track-length 400
    --record-fixture tests/fixtures/session_short.bin`
+
+10. **Session UID — полный u64, SQLite INTEGER — знаковый int64.** Реальные
+    UID игры (например `14147937499142393072`) больше 2^63−1 и роняли каждый
+    op записи с OverflowError (сессия целиком не писалась на диск). Адаптер
+    `sqlite3.register_adapter(int, _adapt_int)` в `storage.py` конвертирует
+    бит-в-бит (two's complement); `_uid_from_db` обратно — в `list_sessions`.
+
+11. **`sessionUID=0` игнорируется в `state.on_packet`.** Игра шлёт uid=0 в
+    меню/переходах; без фильтра это создавало «призрачную» сессию 0 с
+    перезалитой историей кругов из Session History.
+
+12. **Пути XDG (`paths.py`)**: БД `~/.local/share/f1-telemetry/f1.sqlite`,
+    конфиг `~/.config/f1-telemetry/config.json`, логи
+    `~/.local/state/f1-telemetry/logs/app.log`. `cli` и GUI берут дефолты из
+    конфига; флаги `--db/--host/--port` переопределяют только на один запуск.
+    Вкладка «Настройки» (`settings_view.py`) сохраняет конфиг сразу и
+    перезапускает запись. Тесты изолируют XDG autouse-фикстурой в
+    `tests/conftest.py`. `cli anonymize` / `Storage.anonymize` — передача БД
+    третьим лицам (никнеймы → «Driver N`).
